@@ -18,6 +18,8 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.lease_ttl_seconds == 30
     assert settings.poll_interval_seconds == 1.0
     assert settings.worker_concurrency == 4
+    assert settings.log_level == "INFO"
+    assert settings.log_format == "json"
 
 
 def test_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -64,3 +66,27 @@ def test_get_settings_is_cached(monkeypatch: pytest.MonkeyPatch) -> None:
     first = get_settings()
     second = get_settings()
     assert first is second
+
+
+def test_log_format_accepts_json_and_console(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    assert _settings().log_format == "json"
+
+    monkeypatch.setenv("LOG_FORMAT", "console")
+    assert _settings().log_format == "console"
+
+
+def test_invalid_log_format_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    monkeypatch.setenv("LOG_FORMAT", "yaml")
+    with pytest.raises(ValidationError):
+        _settings()
+
+
+def test_invalid_log_level_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    monkeypatch.setenv("LOG_LEVEL", "VERBOSELY")
+    with pytest.raises(ValidationError):
+        _settings()

@@ -1,7 +1,10 @@
+import logging
 from functools import lru_cache
 
 from pydantic import PostgresDsn, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from core.logging import LogFormat
 
 
 class Settings(BaseSettings):
@@ -15,6 +18,24 @@ class Settings(BaseSettings):
     lease_ttl_seconds: int = 30
     poll_interval_seconds: float = 1.0
     worker_concurrency: int = 4
+    log_level: str = "INFO"
+    log_format: LogFormat = "json"
+
+    @field_validator("log_level")
+    @classmethod
+    def log_level_valid(cls, v: str) -> str:
+        normalized = v.upper()
+        if normalized not in logging.getLevelNamesMapping():
+            valid = ", ".join(sorted(logging.getLevelNamesMapping()))
+            raise ValueError(f"log_level must be one of: {valid}")
+        return normalized
+
+    @field_validator("log_format")
+    @classmethod
+    def log_format_valid(cls, v: str) -> str:
+        if v not in {"json", "console"}:
+            raise ValueError('log_format must be "json" or "console"')
+        return v
 
     @field_validator("lease_ttl_seconds")
     @classmethod
