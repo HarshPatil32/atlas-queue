@@ -1,6 +1,9 @@
 .cursor/
 SCRUM_BOARD.md
 
+# Environment
+.env
+
 # Python
 __pycache__/
 *.py[cod]
