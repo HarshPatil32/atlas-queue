@@ -2,9 +2,7 @@ import pytest
 from pydantic import ValidationError
 
 from core.config import Settings, get_settings
-
-# Structural-validation-only URL; tests do not connect to a real database.
-DATABASE_URL = "postgresql+asyncpg://user:password@localhost:5432/atlas_queue"
+from tests.conftest import DATABASE_URL
 
 
 def _settings() -> Settings:
