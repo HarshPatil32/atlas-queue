@@ -20,9 +20,12 @@ from core.db import Base
 
 class JobStatus(StrEnum):
     QUEUED = "queued"
+    SCHEDULED = "scheduled"
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    RETRYING = "retrying"
+    DEAD_LETTER = "dead_letter"
     CANCELLED = "cancelled"
 
 
@@ -30,7 +33,8 @@ class Job(Base):
     __tablename__ = "jobs"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')",
+            "status IN ('queued', 'scheduled', 'running', 'succeeded', "
+            "'failed', 'retrying', 'dead_letter', 'cancelled')",
             name="ck_jobs_status",
         ),
         Index("ix_jobs_queue_status_next_run_at", "queue", "status", "next_run_at"),

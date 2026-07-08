@@ -32,10 +32,14 @@ def test_job_table_name() -> None:
 
 
 def test_job_status_values() -> None:
+    assert len(JobStatus) == 8
     assert JobStatus.QUEUED.value == "queued"
+    assert JobStatus.SCHEDULED.value == "scheduled"
     assert JobStatus.RUNNING.value == "running"
     assert JobStatus.SUCCEEDED.value == "succeeded"
     assert JobStatus.FAILED.value == "failed"
+    assert JobStatus.RETRYING.value == "retrying"
+    assert JobStatus.DEAD_LETTER.value == "dead_letter"
     assert JobStatus.CANCELLED.value == "cancelled"
 
 
@@ -127,6 +131,7 @@ def test_job_status_check_constraint() -> None:
     assert len(constraints) == 1
     constraint = constraints[0]
     assert constraint.name == "ck_jobs_status"
+    # StrEnum preserves declaration order, which must match the constraint SQL.
     expected_values = ", ".join(f"'{status.value}'" for status in JobStatus)
     assert str(constraint.sqltext) == f"status IN ({expected_values})"
 

@@ -86,7 +86,8 @@ def upgrade() -> None:
         sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("failed_at", sa.DateTime(timezone=True), nullable=True),
         sa.CheckConstraint(
-            "status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')",
+            "status IN ('queued', 'scheduled', 'running', 'succeeded', "
+            "'failed', 'retrying', 'dead_letter', 'cancelled')",
             name="ck_jobs_status",
         ),
         sa.PrimaryKeyConstraint("id"),
