@@ -5,17 +5,24 @@ from sqlalchemy import (
     BigInteger,
     CheckConstraint,
     DateTime,
+    ForeignKey,
     Identity,
     Index,
     Integer,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from core.db import Base
+
+
+def _status_check_sql(status_enum: type[StrEnum]) -> str:
+    values = ", ".join(f"'{status.value}'" for status in status_enum)
+    return f"status IN ({values})"
 
 
 class JobStatus(StrEnum):
@@ -32,11 +39,7 @@ class JobStatus(StrEnum):
 class Job(Base):
     __tablename__ = "jobs"
     __table_args__ = (
-        CheckConstraint(
-            "status IN ('queued', 'scheduled', 'running', 'succeeded', "
-            "'failed', 'retrying', 'dead_letter', 'cancelled')",
-            name="ck_jobs_status",
-        ),
+        CheckConstraint(_status_check_sql(JobStatus), name="ck_jobs_status"),
         Index("ix_jobs_queue_status_next_run_at", "queue", "status", "next_run_at"),
         Index("ix_jobs_status_lease_expires_at", "status", "lease_expires_at"),
     )
@@ -114,3 +117,53 @@ class Job(Base):
         DateTime(timezone=True),
         nullable=True,
     )
+
+
+class JobAttemptStatus(StrEnum):
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class JobAttempt(Base):
+    __tablename__ = "job_attempts"
+    __table_args__ = (
+        CheckConstraint(
+            _status_check_sql(JobAttemptStatus),
+            name="ck_job_attempts_status",
+        ),
+        UniqueConstraint(
+            "job_id",
+            "attempt_number",
+            name="uq_job_attempts_job_id_attempt_number",
+        ),
+        Index("ix_job_attempts_worker_id", "worker_id"),
+        Index("ix_job_attempts_status_started_at", "status", "started_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    job_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("jobs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    worker_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default=JobAttemptStatus.RUNNING.value,
+        server_default=JobAttemptStatus.RUNNING.value,
+    )
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    runtime_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)

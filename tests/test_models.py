@@ -5,15 +5,17 @@ from sqlalchemy import (
     BigInteger,
     CheckConstraint,
     DateTime,
+    ForeignKey,
     Index,
     Integer,
     String,
     Table,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 
-from core.models import Job, JobStatus
+from core.models import Job, JobAttempt, JobAttemptStatus, JobStatus
 
 
 def _job_table() -> Table:
@@ -162,5 +164,132 @@ def test_job_timestamp_columns_are_timezone_aware() -> None:
         "failed_at",
     ):
         column = Job.__table__.columns[column_name]
+        assert isinstance(column.type, DateTime)
+        assert column.type.timezone is True
+
+
+def _job_attempt_table() -> Table:
+    return cast(Table, JobAttempt.__table__)
+
+
+def _job_attempt_index(name: str) -> Index:
+    for index in _job_attempt_table().indexes:
+        if isinstance(index, Index) and index.name == name:
+            return index
+    raise AssertionError(f"Missing index: {name}")
+
+
+def test_job_attempt_table_name() -> None:
+    assert JobAttempt.__tablename__ == "job_attempts"
+
+
+def test_job_attempt_status_values() -> None:
+    assert len(JobAttemptStatus) == 4
+    assert JobAttemptStatus.RUNNING.value == "running"
+    assert JobAttemptStatus.SUCCEEDED.value == "succeeded"
+    assert JobAttemptStatus.FAILED.value == "failed"
+    assert JobAttemptStatus.CANCELLED.value == "cancelled"
+
+
+@pytest.mark.parametrize(
+    ("column_name", "expected_type", "nullable"),
+    [
+        ("id", BigInteger, False),
+        ("job_id", BigInteger, False),
+        ("worker_id", String, False),
+        ("attempt_number", Integer, False),
+        ("started_at", DateTime, False),
+        ("finished_at", DateTime, True),
+        ("status", String, False),
+        ("error_message", Text, True),
+        ("runtime_ms", Integer, True),
+    ],
+)
+def test_job_attempt_column_types_and_nullability(
+    column_name: str,
+    expected_type: type,
+    nullable: bool,
+) -> None:
+    column = JobAttempt.__table__.columns[column_name]
+    assert isinstance(column.type, expected_type)
+    assert column.nullable is nullable
+
+
+def test_job_attempt_id_is_primary_key() -> None:
+    assert JobAttempt.__table__.columns["id"].primary_key is True
+
+
+def test_job_attempt_job_id_foreign_key() -> None:
+    foreign_keys = [
+        fk
+        for fk in JobAttempt.__table__.columns["job_id"].foreign_keys
+        if isinstance(fk, ForeignKey)
+    ]
+    assert len(foreign_keys) == 1
+    foreign_key = foreign_keys[0]
+    assert foreign_key.target_fullname == "jobs.id"
+    assert foreign_key.ondelete == "CASCADE"
+
+
+def test_job_attempt_python_column_default() -> None:
+    assert JobAttempt.__table__.columns["status"].default is not None
+    assert (
+        JobAttempt.__table__.columns["status"].default.arg
+        == JobAttemptStatus.RUNNING.value
+    )
+
+
+def test_job_attempt_scalar_server_defaults() -> None:
+    assert JobAttempt.__table__.columns["status"].server_default is not None
+    assert (
+        JobAttempt.__table__.columns["status"].server_default.arg
+        == JobAttemptStatus.RUNNING.value
+    )
+    assert JobAttempt.__table__.columns["started_at"].server_default is not None
+
+
+def test_job_attempt_status_check_constraint() -> None:
+    constraints = [
+        constraint
+        for constraint in _job_attempt_table().constraints
+        if isinstance(constraint, CheckConstraint)
+    ]
+    assert len(constraints) == 1
+    constraint = constraints[0]
+    assert constraint.name == "ck_job_attempts_status"
+    expected_values = ", ".join(f"'{status.value}'" for status in JobAttemptStatus)
+    assert str(constraint.sqltext) == f"status IN ({expected_values})"
+
+
+def test_job_attempt_unique_job_id_attempt_number() -> None:
+    unique_constraints = [
+        constraint
+        for constraint in _job_attempt_table().constraints
+        if isinstance(constraint, UniqueConstraint)
+    ]
+    assert len(unique_constraints) == 1
+    constraint = unique_constraints[0]
+    assert constraint.name == "uq_job_attempts_job_id_attempt_number"
+    assert constraint.columns.keys() == ["job_id", "attempt_number"]
+
+
+def test_job_attempt_worker_id_index() -> None:
+    worker_index = _job_attempt_index("ix_job_attempts_worker_id")
+    assert worker_index.columns.keys() == ["worker_id"]
+
+
+def test_job_attempt_status_started_at_index() -> None:
+    status_index = _job_attempt_index("ix_job_attempts_status_started_at")
+    assert status_index.columns.keys() == ["status", "started_at"]
+
+
+def test_job_attempt_status_is_string_enum() -> None:
+    assert issubclass(JobAttemptStatus, str)
+    assert isinstance(JobAttemptStatus.RUNNING, str)
+
+
+def test_job_attempt_timestamp_columns_are_timezone_aware() -> None:
+    for column_name in ("started_at", "finished_at"):
+        column = JobAttempt.__table__.columns[column_name]
         assert isinstance(column.type, DateTime)
         assert column.type.timezone is True
