@@ -15,7 +15,14 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB
 
-from core.models import Job, JobAttempt, JobAttemptStatus, JobStatus
+from core.models import (
+    Job,
+    JobAttempt,
+    JobAttemptStatus,
+    JobStatus,
+    Worker,
+    WorkerStatus,
+)
 
 
 def _job_table() -> Table:
@@ -291,5 +298,126 @@ def test_job_attempt_status_is_string_enum() -> None:
 def test_job_attempt_timestamp_columns_are_timezone_aware() -> None:
     for column_name in ("started_at", "finished_at"):
         column = JobAttempt.__table__.columns[column_name]
+        assert isinstance(column.type, DateTime)
+        assert column.type.timezone is True
+
+
+def _worker_table() -> Table:
+    return cast(Table, Worker.__table__)
+
+
+def _worker_index(name: str) -> Index:
+    for index in _worker_table().indexes:
+        if isinstance(index, Index) and index.name == name:
+            return index
+    raise AssertionError(f"Missing index: {name}")
+
+
+def test_worker_table_name() -> None:
+    assert Worker.__tablename__ == "workers"
+
+
+def test_worker_status_values() -> None:
+    assert len(WorkerStatus) == 3
+    assert WorkerStatus.IDLE.value == "idle"
+    assert WorkerStatus.RUNNING.value == "running"
+    assert WorkerStatus.OFFLINE.value == "offline"
+
+
+@pytest.mark.parametrize(
+    ("column_name", "expected_type", "nullable"),
+    [
+        ("id", BigInteger, False),
+        ("worker_name", String, False),
+        ("hostname", String, False),
+        ("queues", JSONB, False),
+        ("status", String, False),
+        ("last_heartbeat_at", DateTime, True),
+        ("started_at", DateTime, False),
+        ("current_job_id", BigInteger, True),
+    ],
+)
+def test_worker_column_types_and_nullability(
+    column_name: str,
+    expected_type: type,
+    nullable: bool,
+) -> None:
+    column = Worker.__table__.columns[column_name]
+    assert isinstance(column.type, expected_type)
+    assert column.nullable is nullable
+
+
+def test_worker_id_is_primary_key() -> None:
+    assert Worker.__table__.columns["id"].primary_key is True
+
+
+def test_worker_python_column_defaults() -> None:
+    assert Worker.__table__.columns["queues"].default is not None
+    assert Worker.__table__.columns["status"].default is not None
+    assert Worker.__table__.columns["status"].default.arg == WorkerStatus.IDLE.value
+
+
+def test_worker_nullable_fields_default_to_none_on_construct() -> None:
+    worker = Worker(worker_name="worker-1", hostname="host-1", queues=["default"])
+    assert worker.last_heartbeat_at is None
+    assert worker.current_job_id is None
+
+
+def test_worker_scalar_server_defaults() -> None:
+    assert Worker.__table__.columns["status"].server_default is not None
+    assert (
+        Worker.__table__.columns["status"].server_default.arg == WorkerStatus.IDLE.value
+    )
+    assert Worker.__table__.columns["started_at"].server_default is not None
+
+
+def test_worker_worker_name_is_unique() -> None:
+    column = Worker.__table__.columns["worker_name"]
+    assert column.unique is True
+
+
+def test_worker_status_check_constraint() -> None:
+    constraints = [
+        constraint
+        for constraint in _worker_table().constraints
+        if isinstance(constraint, CheckConstraint)
+    ]
+    assert len(constraints) == 1
+    constraint = constraints[0]
+    assert constraint.name == "ck_workers_status"
+    expected_values = ", ".join(f"'{status.value}'" for status in WorkerStatus)
+    assert str(constraint.sqltext) == f"status IN ({expected_values})"
+
+
+def test_worker_current_job_id_foreign_key() -> None:
+    foreign_keys = [
+        fk
+        for fk in Worker.__table__.columns["current_job_id"].foreign_keys
+        if isinstance(fk, ForeignKey)
+    ]
+    assert len(foreign_keys) == 1
+    foreign_key = foreign_keys[0]
+    assert foreign_key.target_fullname == "jobs.id"
+    assert foreign_key.ondelete == "SET NULL"
+
+
+def test_worker_status_last_heartbeat_at_index() -> None:
+    heartbeat_index = _worker_index("ix_workers_status_last_heartbeat_at")
+    assert heartbeat_index.columns.keys() == ["status", "last_heartbeat_at"]
+
+
+def test_worker_current_job_id_index() -> None:
+    job_index = _worker_index("ix_workers_current_job_id")
+    assert job_index.columns.keys() == ["current_job_id"]
+
+
+def test_worker_status_is_string_enum() -> None:
+    assert issubclass(WorkerStatus, str)
+    assert isinstance(WorkerStatus.IDLE, str)
+
+
+def test_worker_timestamp_columns_are_timezone_aware() -> None:
+    for column_name in ("last_heartbeat_at", "started_at"):
+        column = Worker.__table__.columns[column_name]
         assert isinstance(column.type, DateTime)
         assert column.type.timezone is True

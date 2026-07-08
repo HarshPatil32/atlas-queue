@@ -167,3 +167,43 @@ class JobAttempt(Base):
     )
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     runtime_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class WorkerStatus(StrEnum):
+    IDLE = "idle"
+    RUNNING = "running"
+    OFFLINE = "offline"
+
+
+class Worker(Base):
+    __tablename__ = "workers"
+    __table_args__ = (
+        CheckConstraint(_status_check_sql(WorkerStatus), name="ck_workers_status"),
+        Index("ix_workers_status_last_heartbeat_at", "status", "last_heartbeat_at"),
+        Index("ix_workers_current_job_id", "current_job_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    worker_name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    hostname: Mapped[str] = mapped_column(String(255), nullable=False)
+    queues: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default=WorkerStatus.IDLE.value,
+        server_default=WorkerStatus.IDLE.value,
+    )
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    current_job_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("jobs.id", ondelete="SET NULL"),
+        nullable=True,
+    )
