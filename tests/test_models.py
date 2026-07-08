@@ -146,8 +146,13 @@ def test_job_status_check_constraint() -> None:
 
 
 def test_job_polling_index() -> None:
-    polling_index = _job_index("ix_jobs_queue_status_next_run_at")
-    assert polling_index.columns.keys() == ["queue", "status", "next_run_at"]
+    polling_index = _job_index("ix_jobs_queue_status_priority_next_run_at")
+    assert [str(expression) for expression in polling_index.expressions] == [
+        "jobs.queue",
+        "jobs.status",
+        "priority DESC",
+        "jobs.next_run_at",
+    ]
 
 
 def test_job_lease_reaper_index() -> None:

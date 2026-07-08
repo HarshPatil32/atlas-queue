@@ -13,6 +13,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -40,7 +41,13 @@ class Job(Base):
     __tablename__ = "jobs"
     __table_args__ = (
         CheckConstraint(_status_check_sql(JobStatus), name="ck_jobs_status"),
-        Index("ix_jobs_queue_status_next_run_at", "queue", "status", "next_run_at"),
+        Index(
+            "ix_jobs_queue_status_priority_next_run_at",
+            "queue",
+            "status",
+            text("priority DESC"),
+            "next_run_at",
+        ),
         Index("ix_jobs_status_lease_expires_at", "status", "lease_expires_at"),
     )
 
