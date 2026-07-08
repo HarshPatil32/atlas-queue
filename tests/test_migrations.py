@@ -34,6 +34,10 @@ def test_upgrade_head_offline_sql_runs_without_connecting_to_a_database() -> Non
     command.upgrade(_config(), "head", sql=True)
 
 
+def test_downgrade_base_offline_sql_runs_without_connecting_to_a_database() -> None:
+    command.downgrade(_config(), "head:base", sql=True)
+
+
 def test_revision_template_renders_ruff_clean_script(tmp_path: Path) -> None:
     migrations_dir = tmp_path / "migrations"
     versions_dir = migrations_dir / "versions"
