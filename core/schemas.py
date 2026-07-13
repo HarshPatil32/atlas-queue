@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 from typing import Any
 
@@ -5,18 +6,31 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from core.models import JobStatus
 
+DEFAULT_QUEUE = "default"
+MAX_PAYLOAD_SIZE_BYTES = 256 * 1024
+
 
 class JobCreateRequest(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
-    queue: str = Field(min_length=1, max_length=255)
+    queue: str = Field(default=DEFAULT_QUEUE, min_length=1, max_length=255)
     job_type: str = Field(min_length=1, max_length=255)
     payload: dict[str, Any] = Field(default_factory=dict)
-    priority: int = 0
+    priority: int = Field(default=0, ge=-1000, le=1000)
     max_retries: int = Field(default=3, ge=0)
     run_at: datetime | None = None
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=255)
     timeout_seconds: int = Field(default=60, gt=0)
+
+    @field_validator("payload")
+    @classmethod
+    def payload_within_size_limit(cls, value: dict[str, Any]) -> dict[str, Any]:
+        size = len(json.dumps(value, separators=(",", ":")).encode("utf-8"))
+        if size > MAX_PAYLOAD_SIZE_BYTES:
+            raise ValueError(
+                f"payload exceeds maximum size of {MAX_PAYLOAD_SIZE_BYTES} bytes"
+            )
+        return value
 
     @field_validator("run_at")
     @classmethod

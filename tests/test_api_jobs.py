@@ -113,13 +113,27 @@ async def test_create_job_maps_request_fields_to_job(
     assert body["run_at"] == run_at
 
 
+async def test_create_job_defaults_queue_when_omitted(
+    client_with_session: tuple[AsyncClient, FakeSession],
+) -> None:
+    http_client, fake_session = client_with_session
+    response = await http_client.post(
+        "/jobs",
+        json={"job_type": "send_email"},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["queue"] == "default"
+    assert fake_session.added[0].queue == "default"
+
+
 async def test_create_job_rejects_invalid_body(
     client_with_session: tuple[AsyncClient, FakeSession],
 ) -> None:
     http_client, _fake_session = client_with_session
     response = await http_client.post(
         "/jobs",
-        json={"job_type": "send_email"},
+        json={"queue": "default"},
     )
 
     assert response.status_code == 422

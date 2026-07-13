@@ -1,10 +1,22 @@
+import json
 from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
 
 from core.models import Job, JobStatus
-from core.schemas import JobCreateRequest, JobResponse
+from core.schemas import (
+    DEFAULT_QUEUE,
+    MAX_PAYLOAD_SIZE_BYTES,
+    JobCreateRequest,
+    JobResponse,
+)
+
+
+def test_job_create_request_queue_defaults_to_default_when_omitted() -> None:
+    request = JobCreateRequest(job_type="send_email")
+
+    assert request.queue == DEFAULT_QUEUE
 
 
 def test_job_create_request_minimal_valid_body_uses_defaults() -> None:
@@ -88,6 +100,65 @@ def test_job_create_request_rejects_non_dict_payload(payload: object) -> None:
             job_type="send_email",
             payload=payload,
         )
+
+
+@pytest.mark.parametrize("priority", [-1000, 0, 1000])
+def test_job_create_request_accepts_priority_boundary_values(
+    priority: int,
+) -> None:
+    request = JobCreateRequest(
+        queue="default",
+        job_type="send_email",
+        priority=priority,
+    )
+
+    assert request.priority == priority
+
+
+@pytest.mark.parametrize("priority", [-1001, 1001, 100000])
+def test_job_create_request_rejects_priority_out_of_bounds(priority: int) -> None:
+    with pytest.raises(ValidationError):
+        JobCreateRequest(
+            queue="default",
+            job_type="send_email",
+            priority=priority,
+        )
+
+
+def test_job_create_request_rejects_oversized_payload() -> None:
+    with pytest.raises(ValidationError):
+        JobCreateRequest(
+            queue="default",
+            job_type="send_email",
+            payload={"data": "x" * (MAX_PAYLOAD_SIZE_BYTES + 1)},
+        )
+
+
+def test_job_create_request_accepts_payload_under_size_limit() -> None:
+    request = JobCreateRequest(
+        queue="default",
+        job_type="send_email",
+        payload={"data": "x" * 1000},
+    )
+
+    assert request.payload == {"data": "x" * 1000}
+
+
+def test_job_create_request_accepts_payload_at_size_limit() -> None:
+    overhead = len(json.dumps({"data": ""}, separators=(",", ":")).encode("utf-8"))
+    payload = {"data": "x" * (MAX_PAYLOAD_SIZE_BYTES - overhead)}
+    assert (
+        len(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+        == MAX_PAYLOAD_SIZE_BYTES
+    )
+
+    request = JobCreateRequest(
+        queue="default",
+        job_type="send_email",
+        payload=payload,
+    )
+
+    assert request.payload == payload
 
 
 def test_job_create_request_rejects_naive_run_at() -> None:
