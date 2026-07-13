@@ -8,6 +8,8 @@ from core.models import JobStatus
 
 DEFAULT_QUEUE = "default"
 MAX_PAYLOAD_SIZE_BYTES = 256 * 1024
+DEFAULT_LIMIT = 50
+MAX_LIMIT = 100
 
 
 class JobCreateRequest(BaseModel):
@@ -59,3 +61,10 @@ class JobResponse(BaseModel):
     completed_at: datetime | None
     failed_at: datetime | None
     last_error: str | None
+
+
+class JobListResponse(BaseModel):
+    jobs: list[JobResponse]
+    total: int
+    limit: int
+    offset: int

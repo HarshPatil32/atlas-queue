@@ -1,11 +1,18 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.deps import get_db
-from core.models import Job
-from core.schemas import JobCreateRequest, JobResponse
+from core.models import Job, JobStatus
+from core.schemas import (
+    DEFAULT_LIMIT,
+    MAX_LIMIT,
+    JobCreateRequest,
+    JobListResponse,
+    JobResponse,
+)
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
@@ -30,6 +37,44 @@ async def create_job(
     await session.commit()
     await session.refresh(job)
     return job
+
+
+@router.get("", response_model=JobListResponse)
+async def list_jobs(
+    session: Annotated[AsyncSession, Depends(get_db)],
+    queue: Annotated[str | None, Query(min_length=1, max_length=255)] = None,
+    job_status: Annotated[JobStatus | None, Query(alias="status")] = None,
+    job_type: Annotated[str | None, Query(min_length=1, max_length=255)] = None,
+    limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> JobListResponse:
+    filters = []
+    if queue is not None:
+        filters.append(Job.queue == queue)
+    if job_status is not None:
+        filters.append(Job.status == job_status.value)
+    if job_type is not None:
+        filters.append(Job.job_type == job_type)
+
+    total = (
+        await session.execute(select(func.count()).select_from(Job).where(*filters))
+    ).scalar_one()
+
+    rows = (
+        (
+            await session.execute(
+                select(Job)
+                .where(*filters)
+                .order_by(Job.created_at.desc(), Job.id.desc())
+                .limit(limit)
+                .offset(offset)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    return JobListResponse(jobs=list(rows), total=total, limit=limit, offset=offset)
 
 
 @router.get("/{job_id}", response_model=JobResponse)

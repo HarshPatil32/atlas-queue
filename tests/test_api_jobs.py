@@ -1,5 +1,6 @@
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -7,6 +8,7 @@ from httpx import ASGITransport, AsyncClient
 from api.deps import get_db
 from api.main import app
 from core.models import Job, JobStatus
+from core.schemas import DEFAULT_LIMIT, MAX_LIMIT
 
 
 def _make_job(
@@ -14,6 +16,7 @@ def _make_job(
     job_id: int = 1,
     job_status: str = JobStatus.RUNNING.value,
     last_error: str | None = None,
+    idempotency_key: str | None = "order-123",
 ) -> Job:
     now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
     return Job(
@@ -27,7 +30,7 @@ def _make_job(
         max_retries=3,
         next_run_at=datetime(2026, 6, 1, 15, 30, 0, tzinfo=UTC),
         timeout_seconds=120,
-        idempotency_key="order-123",
+        idempotency_key=idempotency_key,
         locked_by="worker-1",
         locked_at=now,
         lease_expires_at=datetime(2026, 1, 1, 12, 5, 0, tzinfo=UTC),
@@ -39,12 +42,36 @@ def _make_job(
     )
 
 
+class FakeResult:
+    def __init__(
+        self,
+        *,
+        scalar: int | None = None,
+        rows: list[Job] | None = None,
+    ) -> None:
+        self._scalar = scalar
+        self._rows = rows or []
+
+    def scalar_one(self) -> int:
+        assert self._scalar is not None
+        return self._scalar
+
+    def scalars(self) -> "FakeResult":
+        return self
+
+    def all(self) -> list[Job]:
+        return self._rows
+
+
 class FakeSession:
     def __init__(self) -> None:
         self.added: list[Job] = []
         self.jobs: dict[int, Job] = {}
         self.committed = False
         self.next_run_at_unset_before_refresh: list[bool] = []
+        self.list_jobs_rows: list[Job] = []
+        self.list_jobs_total = 0
+        self.execute_call_count = 0
 
     def add(self, job: Job) -> None:
         self.added.append(job)
@@ -70,6 +97,15 @@ class FakeSession:
             job.updated_at = now
         if job.next_run_at is None:
             job.next_run_at = now
+
+    async def execute(self, statement: Any) -> FakeResult:
+        # Does not simulate SQL filtering; returns canned rows for envelope tests only.
+        # list_jobs issues count first, then select; use call order instead of
+        # inspecting SQLAlchemy internals.
+        self.execute_call_count += 1
+        if self.execute_call_count == 1:
+            return FakeResult(scalar=self.list_jobs_total)
+        return FakeResult(rows=self.list_jobs_rows)
 
 
 @pytest.fixture
@@ -248,3 +284,64 @@ async def test_get_job_does_not_expose_internal_lease_fields(
     assert "locked_by" not in body
     assert "locked_at" not in body
     assert "lease_expires_at" not in body
+
+
+async def test_list_jobs_returns_200_with_paginated_envelope(
+    client_with_session: tuple[AsyncClient, FakeSession],
+) -> None:
+    http_client, fake_session = client_with_session
+    fake_session.list_jobs_rows = [
+        _make_job(job_id=1, idempotency_key=None),
+        _make_job(job_id=2, idempotency_key=None),
+    ]
+    fake_session.list_jobs_total = 2
+
+    response = await http_client.get("/jobs")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 2
+    assert body["limit"] == DEFAULT_LIMIT
+    assert body["offset"] == 0
+    assert len(body["jobs"]) == 2
+    assert body["jobs"][0]["job_id"] == 1
+    assert body["jobs"][1]["job_id"] == 2
+
+
+async def test_list_jobs_does_not_expose_internal_lease_fields(
+    client_with_session: tuple[AsyncClient, FakeSession],
+) -> None:
+    http_client, fake_session = client_with_session
+    fake_session.list_jobs_rows = [_make_job()]
+    fake_session.list_jobs_total = 1
+
+    response = await http_client.get("/jobs")
+
+    assert response.status_code == 200
+    job = response.json()["jobs"][0]
+    assert "locked_by" not in job
+    assert "locked_at" not in job
+    assert "lease_expires_at" not in job
+
+
+@pytest.mark.parametrize(
+    ("query", "expected_status"),
+    [
+        ("status=not-a-status", 422),
+        ("queue=", 422),
+        ("job_type=", 422),
+        ("limit=0", 422),
+        (f"limit={MAX_LIMIT + 1}", 422),
+        ("offset=-1", 422),
+    ],
+)
+async def test_list_jobs_rejects_invalid_query_params(
+    client_with_session: tuple[AsyncClient, FakeSession],
+    query: str,
+    expected_status: int,
+) -> None:
+    http_client, _fake_session = client_with_session
+
+    response = await http_client.get(f"/jobs?{query}")
+
+    assert response.status_code == expected_status
