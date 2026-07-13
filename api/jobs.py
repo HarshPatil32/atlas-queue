@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.deps import get_db
@@ -29,4 +29,15 @@ async def create_job(
     session.add(job)
     await session.commit()
     await session.refresh(job)
+    return job
+
+
+@router.get("/{job_id}", response_model=JobResponse)
+async def get_job(
+    job_id: int,
+    session: Annotated[AsyncSession, Depends(get_db)],
+) -> Job:
+    job = await session.get(Job, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
     return job
