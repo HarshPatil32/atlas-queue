@@ -1,7 +1,7 @@
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.deps import get_db
@@ -15,6 +15,8 @@ from core.schemas import (
 )
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
+
+_CANCELLABLE_STATUSES = (JobStatus.QUEUED.value, JobStatus.SCHEDULED.value)
 
 
 @router.post("", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
@@ -86,3 +88,28 @@ async def get_job(
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
+
+
+@router.post("/{job_id}/cancel", response_model=JobResponse)
+async def cancel_job(
+    job_id: int,
+    session: Annotated[AsyncSession, Depends(get_db)],
+) -> Job:
+    result = await session.execute(
+        update(Job)
+        .where(Job.id == job_id, Job.status.in_(_CANCELLABLE_STATUSES))
+        .values(status=JobStatus.CANCELLED.value, updated_at=func.now())
+        .returning(Job)
+    )
+    cancelled_job = result.scalars().one_or_none()
+    if cancelled_job is not None:
+        await session.commit()
+        return cancelled_job
+
+    existing_job = await session.get(Job, job_id)
+    if existing_job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    raise HTTPException(
+        status_code=409,
+        detail=f"Job cannot be cancelled from status '{existing_job.status}'",
+    )

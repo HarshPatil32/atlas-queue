@@ -62,6 +62,11 @@ class FakeResult:
     def all(self) -> list[Job]:
         return self._rows
 
+    def one_or_none(self) -> Job | None:
+        if not self._rows:
+            return None
+        return self._rows[0]
+
 
 class FakeSession:
     def __init__(self) -> None:
@@ -72,6 +77,7 @@ class FakeSession:
         self.list_jobs_rows: list[Job] = []
         self.list_jobs_total = 0
         self.execute_call_count = 0
+        self.update_returning_rows: list[Job] = []
 
     def add(self, job: Job) -> None:
         self.added.append(job)
@@ -102,6 +108,9 @@ class FakeSession:
         # Does not simulate SQL filtering; returns canned rows for envelope tests only.
         # list_jobs issues count first, then select; use call order instead of
         # inspecting SQLAlchemy internals.
+        if getattr(statement, "is_update", False):
+            return FakeResult(rows=self.update_returning_rows)
+
         self.execute_call_count += 1
         if self.execute_call_count == 1:
             return FakeResult(scalar=self.list_jobs_total)
@@ -345,3 +354,75 @@ async def test_list_jobs_rejects_invalid_query_params(
     response = await http_client.get(f"/jobs?{query}")
 
     assert response.status_code == expected_status
+
+
+@pytest.mark.parametrize(
+    "job_status",
+    [JobStatus.QUEUED.value, JobStatus.SCHEDULED.value],
+)
+async def test_cancel_job_returns_200_for_cancellable_statuses(
+    client_with_session: tuple[AsyncClient, FakeSession],
+    job_status: str,
+) -> None:
+    http_client, fake_session = client_with_session
+    cancelled_job = _make_job(job_id=1, job_status=JobStatus.CANCELLED.value)
+    fake_session.update_returning_rows = [cancelled_job]
+
+    response = await http_client.post("/jobs/1/cancel")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job_id"] == 1
+    assert body["status"] == "cancelled"
+    assert fake_session.committed is True
+
+
+async def test_cancel_job_returns_404_when_not_found(
+    client_with_session: tuple[AsyncClient, FakeSession],
+) -> None:
+    http_client, fake_session = client_with_session
+    fake_session.update_returning_rows = []
+
+    response = await http_client.post("/jobs/999/cancel")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Job not found"}
+    assert fake_session.committed is False
+
+
+@pytest.mark.parametrize(
+    "job_status",
+    [
+        JobStatus.RUNNING.value,
+        JobStatus.SUCCEEDED.value,
+        JobStatus.FAILED.value,
+        JobStatus.RETRYING.value,
+        JobStatus.DEAD_LETTER.value,
+        JobStatus.CANCELLED.value,
+    ],
+)
+async def test_cancel_job_returns_409_for_non_cancellable_statuses(
+    client_with_session: tuple[AsyncClient, FakeSession],
+    job_status: str,
+) -> None:
+    http_client, fake_session = client_with_session
+    fake_session.update_returning_rows = []
+    fake_session.jobs[1] = _make_job(job_id=1, job_status=job_status)
+
+    response = await http_client.post("/jobs/1/cancel")
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": f"Job cannot be cancelled from status '{job_status}'"
+    }
+    assert fake_session.committed is False
+
+
+async def test_cancel_job_rejects_invalid_job_id(
+    client_with_session: tuple[AsyncClient, FakeSession],
+) -> None:
+    http_client, _fake_session = client_with_session
+
+    response = await http_client.post("/jobs/not-a-number/cancel")
+
+    assert response.status_code == 422
