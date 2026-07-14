@@ -1,20 +1,10 @@
-import os
-from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from httpx import ASGITransport, AsyncClient
-from sqlalchemy import pool
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from api.deps import get_db
-from api.main import app
-from core.db import Base
 from core.models import Job, JobStatus
-from tests.test_migrations import (
-    LIVE_MIGRATIONS_TEST_DATABASE_URL,
-    _postgres_is_reachable,
-)
 
 
 def _job(
@@ -39,42 +29,6 @@ def _job(
         created_at=created_at,
         updated_at=created_at,
     )
-
-
-@pytest.fixture
-async def live_client() -> (
-    AsyncIterator[tuple[AsyncClient, async_sessionmaker[AsyncSession]]]
-):
-    live_url = os.environ.get(LIVE_MIGRATIONS_TEST_DATABASE_URL)
-    if live_url is None:
-        pytest.skip(
-            "Set LIVE_MIGRATIONS_TEST_DATABASE_URL to a disposable Postgres "
-            "database to run live list-jobs verification."
-        )
-    assert live_url is not None
-
-    if not await _postgres_is_reachable(live_url):
-        pytest.skip("Postgres is not reachable at LIVE_MIGRATIONS_TEST_DATABASE_URL")
-
-    engine = create_async_engine(live_url, poolclass=pool.NullPool)
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-
-    sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
-
-    async def override_get_db() -> AsyncIterator[AsyncSession]:
-        async with sessionmaker() as session:
-            yield session
-
-    app.dependency_overrides[get_db] = override_get_db
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as http_client:
-        yield http_client, sessionmaker
-
-    app.dependency_overrides.pop(get_db, None)
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.drop_all)
-    await engine.dispose()
 
 
 @pytest.fixture

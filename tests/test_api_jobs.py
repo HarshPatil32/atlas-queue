@@ -426,3 +426,85 @@ async def test_cancel_job_rejects_invalid_job_id(
     response = await http_client.post("/jobs/not-a-number/cancel")
 
     assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "job_status",
+    [JobStatus.FAILED.value, JobStatus.DEAD_LETTER.value],
+)
+async def test_retry_job_returns_200_for_retryable_statuses(
+    client_with_session: tuple[AsyncClient, FakeSession],
+    job_status: str,
+) -> None:
+    http_client, fake_session = client_with_session
+    fake_session.jobs[1] = _make_job(job_id=1, job_status=job_status, last_error="boom")
+    retried_job = _make_job(
+        job_id=1,
+        job_status=JobStatus.QUEUED.value,
+        last_error=None,
+    )
+    retried_job.attempts = 0
+    retried_job.failed_at = None
+    fake_session.update_returning_rows = [retried_job]
+
+    response = await http_client.post("/jobs/1/retry")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job_id"] == 1
+    assert body["status"] == "queued"
+    assert body["attempts"] == 0
+    assert body["last_error"] is None
+    assert body["failed_at"] is None
+    assert fake_session.committed is True
+
+
+async def test_retry_job_returns_404_when_not_found(
+    client_with_session: tuple[AsyncClient, FakeSession],
+) -> None:
+    http_client, fake_session = client_with_session
+    fake_session.update_returning_rows = []
+
+    response = await http_client.post("/jobs/999/retry")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Job not found"}
+    assert fake_session.committed is False
+
+
+@pytest.mark.parametrize(
+    "job_status",
+    [
+        JobStatus.QUEUED.value,
+        JobStatus.SCHEDULED.value,
+        JobStatus.RUNNING.value,
+        JobStatus.SUCCEEDED.value,
+        JobStatus.RETRYING.value,
+        JobStatus.CANCELLED.value,
+    ],
+)
+async def test_retry_job_returns_409_for_non_retryable_statuses(
+    client_with_session: tuple[AsyncClient, FakeSession],
+    job_status: str,
+) -> None:
+    http_client, fake_session = client_with_session
+    fake_session.update_returning_rows = []
+    fake_session.jobs[1] = _make_job(job_id=1, job_status=job_status)
+
+    response = await http_client.post("/jobs/1/retry")
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": f"Job cannot be retried from status '{job_status}'"
+    }
+    assert fake_session.committed is False
+
+
+async def test_retry_job_rejects_invalid_job_id(
+    client_with_session: tuple[AsyncClient, FakeSession],
+) -> None:
+    http_client, _fake_session = client_with_session
+
+    response = await http_client.post("/jobs/not-a-number/retry")
+
+    assert response.status_code == 422

@@ -1,5 +1,4 @@
 import asyncio
-import os
 import subprocess
 import sys
 from collections.abc import Generator
@@ -9,14 +8,17 @@ from typing import Any, TypedDict
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import inspect, pool, text
+from sqlalchemy import inspect, pool
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from core.config import get_settings
 from tests.conftest import DATABASE_URL
+from tests.live_postgres import (
+    DEV_TEST_POSTGRES_COMMAND,
+    get_live_test_database_url,
+    postgres_is_reachable,
+)
 
-# Name of the opt-in env var; not the URL itself.
-LIVE_MIGRATIONS_TEST_DATABASE_URL = "LIVE_MIGRATIONS_TEST_DATABASE_URL"
 EXPECTED_TABLES = frozenset({"jobs", "job_attempts", "workers"})
 
 
@@ -67,15 +69,7 @@ def _inspect_migrated_schema(connection) -> MigratedSchema:
 
 
 async def _postgres_is_reachable(database_url: str) -> bool:
-    engine = create_async_engine(database_url, poolclass=pool.NullPool)
-    try:
-        async with engine.connect() as connection:
-            await connection.execute(text("SELECT 1"))
-        return True
-    except Exception:
-        return False
-    finally:
-        await engine.dispose()
+    return await postgres_is_reachable(database_url)
 
 
 async def _read_schema(database_url: str) -> MigratedSchema:
@@ -134,23 +128,22 @@ def test_upgrade_head_and_downgrade_base_against_live_postgres(
 ) -> None:
     """Run live migration verification against a disposable Postgres database.
 
-    Set LIVE_MIGRATIONS_TEST_DATABASE_URL to a throwaway database URL, for
-    example:
-    postgresql+asyncpg://USER:PASSWORD@localhost:5432/atlas_queue_migrations_test
+    Set LIVE_MIGRATIONS_TEST_DATABASE_URL to override the default dev test
+    database, or start the bundled container with:
+    ./scripts/dev-test-postgres.sh up
+
+    Default URL:
+    postgresql+asyncpg://atlas:atlas@localhost:5434/atlas_queue_test
 
     Do not point this at a database that holds data you need to keep. The test
     runs `alembic downgrade base`, which drops all application tables.
     """
-    live_url = os.environ.get(LIVE_MIGRATIONS_TEST_DATABASE_URL)
-    if live_url is None:
-        pytest.skip(
-            "Set LIVE_MIGRATIONS_TEST_DATABASE_URL to a disposable Postgres "
-            "database to run live migration verification."
-        )
-    assert live_url is not None  # pytest.skip is not typed as NoReturn for mypy
-
+    live_url = get_live_test_database_url()
     if not asyncio.run(_postgres_is_reachable(live_url)):
-        pytest.skip("Postgres is not reachable at LIVE_MIGRATIONS_TEST_DATABASE_URL")
+        pytest.skip(
+            f"Live Postgres is not reachable at {live_url}. "
+            f"Start the dev test database with: {DEV_TEST_POSTGRES_COMMAND}"
+        )
 
     monkeypatch.setenv("DATABASE_URL", live_url)
     # Alembic env.py reads get_settings(); clear cache so it picks up live_url.

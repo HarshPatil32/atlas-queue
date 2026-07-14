@@ -1,0 +1,14 @@
+services:
+  postgres-test:
+    image: postgres:16-alpine
+    ports:
+      - "5434:5432"
+    environment:
+      POSTGRES_USER: atlas
+      POSTGRES_PASSWORD: atlas
+      POSTGRES_DB: atlas_queue_test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U atlas -d atlas_queue_test"]
+      interval: 2s
+      timeout: 5s
+      retries: 10

@@ -17,6 +17,7 @@ from core.schemas import (
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
 _CANCELLABLE_STATUSES = (JobStatus.QUEUED.value, JobStatus.SCHEDULED.value)
+_RETRYABLE_STATUSES = (JobStatus.FAILED.value, JobStatus.DEAD_LETTER.value)
 
 
 @router.post("", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
@@ -112,4 +113,41 @@ async def cancel_job(
     raise HTTPException(
         status_code=409,
         detail=f"Job cannot be cancelled from status '{existing_job.status}'",
+    )
+
+
+@router.post("/{job_id}/retry", response_model=JobResponse)
+async def retry_job(
+    job_id: int,
+    session: Annotated[AsyncSession, Depends(get_db)],
+) -> Job:
+    result = await session.execute(
+        update(Job)
+        .where(Job.id == job_id, Job.status.in_(_RETRYABLE_STATUSES))
+        .values(
+            status=JobStatus.QUEUED.value,
+            # Fresh run budget; worker logic should compare attempts to max_retries.
+            attempts=0,
+            # Immediate retry only; no optional run_at delay on this endpoint.
+            next_run_at=func.now(),
+            last_error=None,
+            failed_at=None,
+            locked_by=None,
+            locked_at=None,
+            lease_expires_at=None,
+            updated_at=func.now(),
+        )
+        .returning(Job)
+    )
+    retried_job = result.scalars().one_or_none()
+    if retried_job is not None:
+        await session.commit()
+        return retried_job
+
+    existing_job = await session.get(Job, job_id)
+    if existing_job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    raise HTTPException(
+        status_code=409,
+        detail=f"Job cannot be retried from status '{existing_job.status}'",
     )
