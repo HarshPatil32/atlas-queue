@@ -4,6 +4,7 @@ from typing import Any
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy.exc import IntegrityError
 
 from api.deps import get_db
 from api.main import app
@@ -73,6 +74,8 @@ class FakeSession:
         self.added: list[Job] = []
         self.jobs: dict[int, Job] = {}
         self.committed = False
+        self.rolled_back = False
+        self.commit_raises_integrity_error = False
         self.next_run_at_unset_before_refresh: list[bool] = []
         self.list_jobs_rows: list[Job] = []
         self.list_jobs_total = 0
@@ -86,7 +89,16 @@ class FakeSession:
         return self.jobs.get(job_id)
 
     async def commit(self) -> None:
+        if self.commit_raises_integrity_error:
+            raise IntegrityError(
+                "duplicate idempotency_key",
+                params=None,
+                orig=Exception("duplicate idempotency_key"),
+            )
         self.committed = True
+
+    async def rollback(self) -> None:
+        self.rolled_back = True
 
     async def refresh(self, job: Job) -> None:
         self.next_run_at_unset_before_refresh.append(job.next_run_at is None)
@@ -216,6 +228,26 @@ async def test_create_job_rejects_invalid_body(
     )
 
     assert response.status_code == 422
+
+
+async def test_create_job_returns_409_when_idempotency_key_conflicts(
+    client_with_session: tuple[AsyncClient, FakeSession],
+) -> None:
+    http_client, fake_session = client_with_session
+    fake_session.commit_raises_integrity_error = True
+
+    response = await http_client.post(
+        "/jobs",
+        json={
+            "job_type": "send_email",
+            "idempotency_key": "order-123",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Job with this idempotency_key already exists"}
+    assert fake_session.rolled_back is True
+    assert fake_session.committed is False
 
 
 async def test_get_job_returns_200_with_full_status_detail(

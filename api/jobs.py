@@ -2,6 +2,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.deps import get_db
@@ -37,8 +38,15 @@ async def create_job(
     if payload.run_at is not None:
         job.next_run_at = payload.run_at
     session.add(job)
-    await session.commit()
-    await session.refresh(job)
+    try:
+        await session.commit()
+        await session.refresh(job)
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Job with this idempotency_key already exists",
+        ) from None
     return job
 
 
