@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,6 +24,7 @@ _RETRYABLE_STATUSES = (JobStatus.FAILED.value, JobStatus.DEAD_LETTER.value)
 @router.post("", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
 async def create_job(
     payload: JobCreateRequest,
+    response: Response,
     session: Annotated[AsyncSession, Depends(get_db)],
 ) -> Job:
     job = Job(
@@ -43,10 +44,21 @@ async def create_job(
         await session.refresh(job)
     except IntegrityError:
         await session.rollback()
-        raise HTTPException(
-            status_code=409,
-            detail="Job with this idempotency_key already exists in this queue",
-        ) from None
+        if payload.idempotency_key is not None:
+            existing_job = await session.scalar(
+                select(Job).where(
+                    Job.queue == payload.queue,
+                    Job.idempotency_key == payload.idempotency_key,
+                )
+            )
+            if existing_job is not None:
+                response.status_code = status.HTTP_200_OK
+                return existing_job
+            raise HTTPException(
+                status_code=409,
+                detail="Job with this idempotency_key already exists in this queue",
+            ) from None
+        raise
     return job
 
 
