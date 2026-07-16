@@ -41,6 +41,11 @@ class Job(Base):
     __tablename__ = "jobs"
     __table_args__ = (
         CheckConstraint(_status_check_sql(JobStatus), name="ck_jobs_status"),
+        UniqueConstraint(
+            "queue",
+            "idempotency_key",
+            name="uq_jobs_queue_idempotency_key",
+        ),
         Index(
             "ix_jobs_queue_status_priority_next_run_at",
             "queue",
@@ -90,11 +95,7 @@ class Job(Base):
         default=60,
         server_default="60",
     )
-    idempotency_key: Mapped[str | None] = mapped_column(
-        String(255),
-        unique=True,
-        nullable=True,
-    )
+    idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     locked_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     locked_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),

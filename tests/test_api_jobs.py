@@ -245,7 +245,9 @@ async def test_create_job_returns_409_when_idempotency_key_conflicts(
     )
 
     assert response.status_code == 409
-    assert response.json() == {"detail": "Job with this idempotency_key already exists"}
+    assert response.json() == {
+        "detail": "Job with this idempotency_key already exists in this queue"
+    }
     assert fake_session.rolled_back is True
     assert fake_session.committed is False
 

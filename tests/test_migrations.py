@@ -25,6 +25,7 @@ EXPECTED_TABLES = frozenset({"jobs", "job_attempts", "workers"})
 class MigratedSchema(TypedDict):
     table_names: set[str]
     jobs_indexes: set[str]
+    jobs_unique_constraints: list[dict[str, Any]]
     job_attempt_fks: list[dict[str, Any]]
     worker_fks: list[dict[str, Any]]
     jobs_checks: set[str]
@@ -48,6 +49,7 @@ def _inspect_migrated_schema(connection) -> MigratedSchema:
     inspector = inspect(connection)
     table_names = set(inspector.get_table_names())
     jobs_indexes = {index["name"] for index in inspector.get_indexes("jobs")}
+    jobs_unique_constraints = inspector.get_unique_constraints("jobs")
     job_attempt_fks = inspector.get_foreign_keys("job_attempts")
     worker_fks = inspector.get_foreign_keys("workers")
     jobs_checks = {check["name"] for check in inspector.get_check_constraints("jobs")}
@@ -60,6 +62,7 @@ def _inspect_migrated_schema(connection) -> MigratedSchema:
     return {
         "table_names": table_names,
         "jobs_indexes": jobs_indexes,
+        "jobs_unique_constraints": jobs_unique_constraints,
         "job_attempt_fks": job_attempt_fks,
         "worker_fks": worker_fks,
         "jobs_checks": jobs_checks,
@@ -101,6 +104,12 @@ def _assert_upgraded_schema(schema: MigratedSchema) -> None:
     jobs_indexes = schema["jobs_indexes"]
     assert "ix_jobs_queue_status_priority_next_run_at" in jobs_indexes
     assert "ix_jobs_status_lease_expires_at" in jobs_indexes
+
+    jobs_unique_constraints = schema["jobs_unique_constraints"]
+    assert len(jobs_unique_constraints) == 1
+    jobs_unique_constraint = jobs_unique_constraints[0]
+    assert jobs_unique_constraint["name"] == "uq_jobs_queue_idempotency_key"
+    assert jobs_unique_constraint["column_names"] == ["queue", "idempotency_key"]
 
     job_attempt_fks = schema["job_attempt_fks"]
     assert len(job_attempt_fks) == 1

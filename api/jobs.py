@@ -45,7 +45,7 @@ async def create_job(
         await session.rollback()
         raise HTTPException(
             status_code=409,
-            detail="Job with this idempotency_key already exists",
+            detail="Job with this idempotency_key already exists in this queue",
         ) from None
     return job
 
