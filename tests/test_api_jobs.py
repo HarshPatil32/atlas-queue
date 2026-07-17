@@ -76,6 +76,7 @@ class FakeSession:
         self.committed = False
         self.rolled_back = False
         self.commit_raises_integrity_error = False
+        self.idempotency_conflict_existing_job: Job | None = None
         self.next_run_at_unset_before_refresh: list[bool] = []
         self.list_jobs_rows: list[Job] = []
         self.list_jobs_total = 0
@@ -99,6 +100,9 @@ class FakeSession:
 
     async def rollback(self) -> None:
         self.rolled_back = True
+
+    async def scalar(self, statement: Any) -> Job | None:
+        return self.idempotency_conflict_existing_job
 
     async def refresh(self, job: Job) -> None:
         self.next_run_at_unset_before_refresh.append(job.next_run_at is None)
@@ -230,11 +234,54 @@ async def test_create_job_rejects_invalid_body(
     assert response.status_code == 422
 
 
-async def test_create_job_returns_409_when_idempotency_key_conflicts(
+async def test_create_job_returns_200_with_existing_job_when_idempotency_key_conflicts(
+    client_with_session: tuple[AsyncClient, FakeSession],
+) -> None:
+    http_client, fake_session = client_with_session
+    existing_job = _make_job(job_id=42, job_status=JobStatus.QUEUED.value)
+    fake_session.commit_raises_integrity_error = True
+    fake_session.idempotency_conflict_existing_job = existing_job
+
+    response = await http_client.post(
+        "/jobs",
+        json={
+            "job_type": "send_email",
+            "idempotency_key": "order-123",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job_id"] == 42
+    assert body["queue"] == "emails"
+    assert body["job_type"] == "send_email"
+    assert body["idempotency_key"] == "order-123"
+    assert fake_session.rolled_back is True
+    assert fake_session.committed is False
+
+
+async def test_create_job_reraises_integrity_error_when_idempotency_key_omitted(
     client_with_session: tuple[AsyncClient, FakeSession],
 ) -> None:
     http_client, fake_session = client_with_session
     fake_session.commit_raises_integrity_error = True
+
+    with pytest.raises(IntegrityError):
+        await http_client.post(
+            "/jobs",
+            json={"job_type": "send_email"},
+        )
+
+    assert fake_session.rolled_back is True
+    assert fake_session.committed is False
+
+
+async def test_create_job_returns_409_when_idempotency_conflict_lookup_fails(
+    client_with_session: tuple[AsyncClient, FakeSession],
+) -> None:
+    http_client, fake_session = client_with_session
+    fake_session.commit_raises_integrity_error = True
+    fake_session.idempotency_conflict_existing_job = None
 
     response = await http_client.post(
         "/jobs",
@@ -245,7 +292,9 @@ async def test_create_job_returns_409_when_idempotency_key_conflicts(
     )
 
     assert response.status_code == 409
-    assert response.json() == {"detail": "Job with this idempotency_key already exists"}
+    assert response.json() == {
+        "detail": "Job with this idempotency_key already exists in this queue"
+    }
     assert fake_session.rolled_back is True
     assert fake_session.committed is False
 

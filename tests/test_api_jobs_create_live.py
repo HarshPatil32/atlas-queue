@@ -37,10 +37,11 @@ async def _seed_job_with_idempotency_key(
     sessionmaker: async_sessionmaker[AsyncSession],
     *,
     idempotency_key: str,
+    queue: str = "emails",
 ) -> Job:
     created_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
     job = _job(
-        queue="emails",
+        queue=queue,
         job_type="send_email",
         idempotency_key=idempotency_key,
         created_at=created_at,
@@ -52,11 +53,45 @@ async def _seed_job_with_idempotency_key(
     return job
 
 
-async def test_create_job_returns_409_when_idempotency_key_conflicts(
+async def test_create_job_allows_same_idempotency_key_in_different_queue(
     live_client: tuple[AsyncClient, async_sessionmaker[AsyncSession]],
 ) -> None:
     http_client, sessionmaker = live_client
-    await _seed_job_with_idempotency_key(sessionmaker, idempotency_key="order-123")
+    await _seed_job_with_idempotency_key(
+        sessionmaker,
+        idempotency_key="order-789",
+        queue="emails",
+    )
+
+    response = await http_client.post(
+        "/jobs",
+        json={
+            "queue": "sms",
+            "job_type": "send_sms",
+            "idempotency_key": "order-789",
+        },
+    )
+
+    assert response.status_code == 201
+
+    async with sessionmaker() as session:
+        count = (
+            await session.execute(
+                select(func.count())
+                .select_from(Job)
+                .where(Job.idempotency_key == "order-789")
+            )
+        ).scalar_one()
+        assert count == 2
+
+
+async def test_create_job_returns_200_with_existing_job_when_idempotency_key_conflicts(
+    live_client: tuple[AsyncClient, async_sessionmaker[AsyncSession]],
+) -> None:
+    http_client, sessionmaker = live_client
+    seeded_job = await _seed_job_with_idempotency_key(
+        sessionmaker, idempotency_key="order-123"
+    )
 
     response = await http_client.post(
         "/jobs",
@@ -67,8 +102,8 @@ async def test_create_job_returns_409_when_idempotency_key_conflicts(
         },
     )
 
-    assert response.status_code == 409
-    assert response.json() == {"detail": "Job with this idempotency_key already exists"}
+    assert response.status_code == 200
+    assert response.json()["job_id"] == seeded_job.id
 
     async with sessionmaker() as session:
         count = (
@@ -96,8 +131,9 @@ async def test_create_job_is_atomic_under_concurrent_idempotency_requests(
         http_client.post("/jobs", json=payload),
     )
 
-    status_codes = sorted([response_one.status_code, response_two.status_code])
-    assert status_codes == [201, 409]
+    status_codes = {response_one.status_code, response_two.status_code}
+    assert status_codes <= {200, 201}
+    assert response_one.json()["job_id"] == response_two.json()["job_id"]
 
     async with sessionmaker() as session:
         count = (

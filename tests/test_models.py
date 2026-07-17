@@ -126,9 +126,19 @@ def test_job_timestamp_server_defaults() -> None:
         assert column.server_default is not None
 
 
-def test_job_idempotency_key_is_unique() -> None:
+def test_job_queue_idempotency_key_is_unique() -> None:
     column = Job.__table__.columns["idempotency_key"]
-    assert column.unique is True
+    assert column.unique is not True
+
+    unique_constraints = [
+        constraint
+        for constraint in _job_table().constraints
+        if isinstance(constraint, UniqueConstraint)
+    ]
+    assert len(unique_constraints) == 1
+    constraint = unique_constraints[0]
+    assert constraint.name == "uq_jobs_queue_idempotency_key"
+    assert constraint.columns.keys() == ["queue", "idempotency_key"]
 
 
 def test_job_status_check_constraint() -> None:
