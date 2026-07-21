@@ -1,0 +1,355 @@
+import asyncio
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
+
+import pytest
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from core.config import get_settings
+from core.db import Base, dispose_engine, get_engine, get_sessionmaker
+from core.models import Job, JobStatus
+from tests.live_postgres import drop_metadata_tables, require_live_postgres_async
+from worker.claim import _CLAIMABLE_STATUSES, claim_jobs
+
+DEFAULT_LEASE_SECONDS = 30
+
+
+@pytest.fixture
+async def live_claim_db(
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    live_url = await require_live_postgres_async()
+
+    monkeypatch.setenv("DATABASE_URL", live_url)
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_sessionmaker.cache_clear()
+
+    engine = get_engine()
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+
+    yield get_sessionmaker()
+
+    await drop_metadata_tables(engine)
+    await dispose_engine()
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_sessionmaker.cache_clear()
+
+
+async def _insert_job(
+    session: AsyncSession,
+    *,
+    queue: str = "default",
+    status: str = JobStatus.QUEUED.value,
+    priority: int = 0,
+    next_run_at: datetime | None = None,
+    created_at: datetime | None = None,
+    job_type: str = "test",
+) -> Job:
+    now = datetime.now(UTC)
+    job = Job(
+        queue=queue,
+        job_type=job_type,
+        payload_json={},
+        status=status,
+        priority=priority,
+        next_run_at=next_run_at or now,
+        created_at=created_at or now,
+    )
+    session.add(job)
+    await session.commit()
+    await session.refresh(job)
+    return job
+
+
+async def test_claim_jobs_orders_by_priority_next_run_at_created_at(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    async with live_claim_db() as session:
+        job_low = await _insert_job(
+            session,
+            priority=1,
+            next_run_at=base + timedelta(minutes=2),
+            created_at=base,
+        )
+        job_high = await _insert_job(
+            session,
+            priority=10,
+            next_run_at=base + timedelta(minutes=1),
+            created_at=base + timedelta(seconds=1),
+        )
+        # Same priority and next_run_at; created_at ASC breaks the tie.
+        job_tie_earlier_created = await _insert_job(
+            session,
+            priority=10,
+            next_run_at=base,
+            created_at=base + timedelta(seconds=2),
+        )
+        job_tie_later_created = await _insert_job(
+            session,
+            priority=10,
+            next_run_at=base,
+            created_at=base + timedelta(seconds=3),
+        )
+
+    async with live_claim_db() as session:
+        claimed = await claim_jobs(
+            session,
+            queues=["default"],
+            worker_name="worker-1",
+            limit=10,
+            lease_seconds=DEFAULT_LEASE_SECONDS,
+        )
+
+    assert [job.id for job in claimed] == [
+        job_tie_earlier_created.id,
+        job_tie_later_created.id,
+        job_high.id,
+        job_low.id,
+    ]
+
+
+async def test_claim_jobs_skips_non_claimable_statuses(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_claim_db() as session:
+        claimable = await _insert_job(session, status=JobStatus.QUEUED.value)
+        for status in JobStatus:
+            if status.value in _CLAIMABLE_STATUSES:
+                continue
+            await _insert_job(session, status=status.value)
+
+    async with live_claim_db() as session:
+        claimed = await claim_jobs(
+            session,
+            queues=["default"],
+            worker_name="worker-1",
+            limit=10,
+            lease_seconds=DEFAULT_LEASE_SECONDS,
+        )
+
+    assert len(claimed) == 1
+    assert claimed[0].id == claimable.id
+
+
+async def test_claim_jobs_skips_jobs_not_yet_due(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    future = datetime.now(UTC) + timedelta(hours=1)
+    async with live_claim_db() as session:
+        due = await _insert_job(session, next_run_at=datetime.now(UTC))
+        await _insert_job(session, next_run_at=future)
+
+    async with live_claim_db() as session:
+        claimed = await claim_jobs(
+            session,
+            queues=["default"],
+            worker_name="worker-1",
+            limit=10,
+            lease_seconds=DEFAULT_LEASE_SECONDS,
+        )
+
+    assert len(claimed) == 1
+    assert claimed[0].id == due.id
+
+
+async def test_claim_jobs_filters_by_queue(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_claim_db() as session:
+        in_queue = await _insert_job(session, queue="alpha")
+        await _insert_job(session, queue="beta")
+
+    async with live_claim_db() as session:
+        claimed = await claim_jobs(
+            session,
+            queues=["alpha"],
+            worker_name="worker-1",
+            limit=10,
+            lease_seconds=DEFAULT_LEASE_SECONDS,
+        )
+
+    assert len(claimed) == 1
+    assert claimed[0].id == in_queue.id
+
+
+async def test_claim_jobs_respects_limit(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_claim_db() as session:
+        for _ in range(5):
+            await _insert_job(session)
+
+    async with live_claim_db() as session:
+        claimed = await claim_jobs(
+            session,
+            queues=["default"],
+            worker_name="worker-1",
+            limit=2,
+            lease_seconds=DEFAULT_LEASE_SECONDS,
+        )
+
+    assert len(claimed) == 2
+
+    async with live_claim_db() as session:
+        remaining = (
+            await session.scalars(
+                select(Job).where(Job.status == JobStatus.QUEUED.value)
+            )
+        ).all()
+
+    assert len(remaining) == 3
+
+
+async def test_claim_jobs_mutates_job_state(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_claim_db() as session:
+        job = await _insert_job(session)
+        assert job.attempts == 0
+
+    async with live_claim_db() as session:
+        claimed = await claim_jobs(
+            session,
+            queues=["default"],
+            worker_name="worker-1",
+            limit=1,
+            lease_seconds=DEFAULT_LEASE_SECONDS,
+        )
+
+    assert len(claimed) == 1
+    claimed_job = claimed[0]
+    assert claimed_job.status == JobStatus.RUNNING.value
+    assert claimed_job.locked_by == "worker-1"
+    assert claimed_job.locked_at is not None
+    assert claimed_job.lease_expires_at is not None
+    assert claimed_job.attempts == 1
+    assert (
+        claimed_job.lease_expires_at - claimed_job.locked_at
+    ).total_seconds() == pytest.approx(DEFAULT_LEASE_SECONDS, abs=2)
+
+
+async def test_claim_jobs_returns_empty_when_limit_is_zero(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_claim_db() as session:
+        await _insert_job(session)
+
+    async with live_claim_db() as session:
+        claimed = await claim_jobs(
+            session,
+            queues=["default"],
+            worker_name="worker-1",
+            limit=0,
+            lease_seconds=DEFAULT_LEASE_SECONDS,
+        )
+
+    assert claimed == []
+
+
+async def test_claim_jobs_returns_empty_when_queues_is_empty(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_claim_db() as session:
+        await _insert_job(session)
+
+    async with live_claim_db() as session:
+        claimed = await claim_jobs(
+            session,
+            queues=[],
+            worker_name="worker-1",
+            limit=10,
+            lease_seconds=DEFAULT_LEASE_SECONDS,
+        )
+
+    assert claimed == []
+
+
+async def test_claim_jobs_rejects_non_positive_lease_seconds(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_claim_db() as session:
+        await _insert_job(session)
+
+    async with live_claim_db() as session:
+        with pytest.raises(ValueError, match="lease_seconds must be > 0"):
+            await claim_jobs(
+                session,
+                queues=["default"],
+                worker_name="worker-1",
+                limit=1,
+                lease_seconds=0,
+            )
+
+
+async def test_claim_jobs_skips_locked_row(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_claim_db() as session:
+        locked_job = await _insert_job(session, priority=10)
+        other_job = await _insert_job(session, priority=1)
+
+    lock_ready = asyncio.Event()
+    release_lock = asyncio.Event()
+
+    async def hold_lock() -> None:
+        async with live_claim_db() as session:
+            await session.execute(
+                select(Job.id)
+                .where(Job.id == locked_job.id)
+                .with_for_update(skip_locked=True)
+            )
+            lock_ready.set()
+            await release_lock.wait()
+            await session.rollback()
+
+    async def claim_while_locked() -> list[Job]:
+        await lock_ready.wait()
+        async with live_claim_db() as session:
+            return await claim_jobs(
+                session,
+                queues=["default"],
+                worker_name="worker-2",
+                limit=10,
+                lease_seconds=DEFAULT_LEASE_SECONDS,
+            )
+
+    holder = asyncio.create_task(hold_lock())
+    try:
+        claimed = await asyncio.wait_for(claim_while_locked(), timeout=5.0)
+    finally:
+        release_lock.set()
+        await holder
+
+    assert len(claimed) == 1
+    assert claimed[0].id == other_job.id
+
+
+async def test_concurrent_claim_jobs_do_not_double_claim(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_claim_db() as session:
+        jobs = [await _insert_job(session) for _ in range(4)]
+
+    async def claim_batch(worker_name: str) -> list[Job]:
+        async with live_claim_db() as session:
+            return await claim_jobs(
+                session,
+                queues=["default"],
+                worker_name=worker_name,
+                limit=4,
+                lease_seconds=DEFAULT_LEASE_SECONDS,
+            )
+
+    first_batch, second_batch = await asyncio.gather(
+        claim_batch("worker-a"),
+        claim_batch("worker-b"),
+    )
+
+    claimed_ids = {job.id for job in first_batch + second_batch}
+    assert claimed_ids == {job.id for job in jobs}
+    assert len(claimed_ids) == len(jobs)

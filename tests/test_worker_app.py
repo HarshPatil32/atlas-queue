@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from core.config import get_settings
 from core.db import Base, dispose_engine, get_engine, get_session, get_sessionmaker
 from core.models import Worker, WorkerStatus
-from tests.live_postgres import require_live_postgres_async
+from tests.live_postgres import drop_metadata_tables, require_live_postgres_async
 from worker.app import get_worker, heartbeat, mark_offline, register_worker, run_loop
 
 
@@ -29,8 +29,7 @@ async def live_worker_db(
 
     yield get_sessionmaker()
 
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.drop_all)
+    await drop_metadata_tables(engine)
     await dispose_engine()
     get_settings.cache_clear()
     get_engine.cache_clear()

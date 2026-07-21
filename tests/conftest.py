@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from api.deps import get_db
 from api.main import app
 from core.db import Base
-from tests.live_postgres import require_live_postgres_async
+from tests.live_postgres import drop_metadata_tables, require_live_postgres_async
 
 # Structural-validation-only URL; tests do not connect to a real database.
 DATABASE_URL = "postgresql+asyncpg://user:password@localhost:5432/atlas_queue"
@@ -41,6 +41,5 @@ async def live_client() -> (
         yield http_client, sessionmaker
 
     app.dependency_overrides.pop(get_db, None)
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.drop_all)
+    await drop_metadata_tables(engine)
     await engine.dispose()
