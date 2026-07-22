@@ -1,5 +1,7 @@
 import asyncio
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+from typing import TypedDict
 
 import pytest
 from sqlalchemy import select
@@ -7,9 +9,38 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from core.config import get_settings
 from core.db import Base, dispose_engine, get_engine, get_session, get_sessionmaker
-from core.models import Worker, WorkerStatus
+from core.models import Job, JobStatus, Worker, WorkerStatus
 from tests.live_postgres import drop_metadata_tables, require_live_postgres_async
 from worker.app import get_worker, heartbeat, mark_offline, register_worker, run_loop
+
+DEFAULT_LEASE_SECONDS = 30
+
+
+class RunLoopKwargs(TypedDict):
+    queues: list[str]
+    limit: int
+    lease_seconds: int
+    poll_interval_seconds: float
+    backoff_multiplier: float
+    backoff_max_seconds: float
+
+
+DEFAULT_RUN_LOOP_KWARGS: RunLoopKwargs = {
+    "queues": ["default"],
+    "limit": 1,
+    "lease_seconds": DEFAULT_LEASE_SECONDS,
+    "poll_interval_seconds": 0.05,
+    "backoff_multiplier": 2.0,
+    "backoff_max_seconds": 1.0,
+}
+
+
+async def _cancel_background_task(task: asyncio.Task[object]) -> None:
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 @pytest.fixture
@@ -34,6 +65,29 @@ async def live_worker_db(
     get_settings.cache_clear()
     get_engine.cache_clear()
     get_sessionmaker.cache_clear()
+
+
+async def _insert_job(
+    session: AsyncSession,
+    *,
+    queue: str = "default",
+    status: str = JobStatus.QUEUED.value,
+    job_type: str = "test",
+) -> Job:
+    now = datetime.now(UTC)
+    job = Job(
+        queue=queue,
+        job_type=job_type,
+        payload_json={},
+        status=status,
+        priority=0,
+        next_run_at=now,
+        created_at=now,
+    )
+    session.add(job)
+    await session.commit()
+    await session.refresh(job)
+    return job
 
 
 async def test_register_worker_inserts_row(
@@ -162,21 +216,197 @@ async def test_run_loop_updates_heartbeat_until_shutdown(
         await asyncio.wait_for(
             run_loop(
                 name="worker-loop",
-                poll_interval_seconds=0.05,
                 shutdown_event=shutdown_event,
+                **DEFAULT_RUN_LOOP_KWARGS,
             ),
             timeout=2.0,
         )
     finally:
-        stopper.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await stopper
+        await _cancel_background_task(stopper)
 
     async with live_worker_db() as session:
         worker = await get_worker(session, name="worker-loop")
         assert worker is not None
         assert worker.last_heartbeat_at is not None
         assert worker.last_heartbeat_at > initial_heartbeat
+
+
+async def test_run_loop_claims_available_job(
+    live_worker_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_worker_db() as session:
+        await register_worker(
+            session,
+            name="worker-loop",
+            hostname="host-a",
+            queues=["default"],
+        )
+        job = await _insert_job(session)
+
+    shutdown_event = asyncio.Event()
+
+    async def stop_after_claim() -> None:
+        for _ in range(50):
+            async with get_session() as session:
+                claimed_job = await session.scalar(select(Job).where(Job.id == job.id))
+                if (
+                    claimed_job is not None
+                    and claimed_job.status == JobStatus.RUNNING.value
+                ):
+                    shutdown_event.set()
+                    return
+            await asyncio.sleep(0.02)
+
+    stopper = asyncio.create_task(stop_after_claim())
+    try:
+        await asyncio.wait_for(
+            run_loop(
+                name="worker-loop",
+                shutdown_event=shutdown_event,
+                **DEFAULT_RUN_LOOP_KWARGS,
+            ),
+            timeout=3.0,
+        )
+    finally:
+        await _cancel_background_task(stopper)
+
+    async with live_worker_db() as session:
+        claimed_job = await session.scalar(select(Job).where(Job.id == job.id))
+
+    assert claimed_job is not None
+    assert claimed_job.status == JobStatus.RUNNING.value
+    assert claimed_job.locked_by == "worker-loop"
+
+
+async def test_run_loop_backs_off_when_queue_empty(
+    live_worker_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_worker_db() as session:
+        await register_worker(
+            session,
+            name="worker-loop",
+            hostname="host-a",
+            queues=["default"],
+        )
+
+    shutdown_event = asyncio.Event()
+    heartbeat_times: list[datetime] = []
+
+    async def record_heartbeats() -> None:
+        last: datetime | None = None
+        for _ in range(100):
+            async with get_session() as session:
+                worker = await get_worker(session, name="worker-loop")
+                if worker is not None and worker.last_heartbeat_at is not None:
+                    current = worker.last_heartbeat_at
+                    if last != current:
+                        heartbeat_times.append(current)
+                        last = current
+                        if len(heartbeat_times) >= 4:
+                            shutdown_event.set()
+                            return
+            await asyncio.sleep(0.01)
+
+    stopper = asyncio.create_task(record_heartbeats())
+    try:
+        await asyncio.wait_for(
+            run_loop(
+                name="worker-loop",
+                shutdown_event=shutdown_event,
+                **DEFAULT_RUN_LOOP_KWARGS,
+            ),
+            timeout=5.0,
+        )
+    finally:
+        await _cancel_background_task(stopper)
+
+    gaps = [
+        (heartbeat_times[index + 1] - heartbeat_times[index]).total_seconds()
+        for index in range(len(heartbeat_times) - 1)
+    ]
+    assert len(gaps) >= 2
+    assert gaps[1] > gaps[0] * 1.5
+
+
+async def test_run_loop_resets_backoff_after_claim(
+    live_worker_db: async_sessionmaker[AsyncSession],
+) -> None:
+    poll_interval = 0.05
+    backoff_max = 0.2
+
+    async with live_worker_db() as session:
+        await register_worker(
+            session,
+            name="worker-loop",
+            hostname="host-a",
+            queues=["default"],
+        )
+
+    shutdown_event = asyncio.Event()
+    heartbeat_times: list[datetime] = []
+    job_id: int | None = None
+
+    async def watch_loop() -> None:
+        nonlocal job_id
+        last: datetime | None = None
+        for _ in range(200):
+            async with get_session() as session:
+                worker = await get_worker(session, name="worker-loop")
+                if worker is not None and worker.last_heartbeat_at is not None:
+                    current = worker.last_heartbeat_at
+                    if last != current:
+                        heartbeat_times.append(current)
+                        last = current
+
+                if job_id is None and len(heartbeat_times) >= 3:
+                    job = await _insert_job(session)
+                    job_id = job.id
+
+                if job_id is not None:
+                    claimed_job = await session.scalar(
+                        select(Job).where(Job.id == job_id)
+                    )
+                    if (
+                        claimed_job is not None
+                        and claimed_job.status == JobStatus.RUNNING.value
+                        and len(heartbeat_times) >= 5
+                    ):
+                        shutdown_event.set()
+                        return
+            await asyncio.sleep(0.01)
+
+    stopper = asyncio.create_task(watch_loop())
+    try:
+        await asyncio.wait_for(
+            run_loop(
+                name="worker-loop",
+                shutdown_event=shutdown_event,
+                queues=["default"],
+                limit=1,
+                lease_seconds=DEFAULT_LEASE_SECONDS,
+                poll_interval_seconds=poll_interval,
+                backoff_multiplier=2.0,
+                backoff_max_seconds=backoff_max,
+            ),
+            timeout=5.0,
+        )
+    finally:
+        await _cancel_background_task(stopper)
+
+    pre_claim_gaps = [
+        (heartbeat_times[i + 1] - heartbeat_times[i]).total_seconds() for i in range(2)
+    ]
+    post_claim_gaps = [
+        (heartbeat_times[i + 1] - heartbeat_times[i]).total_seconds()
+        for i in range(3, len(heartbeat_times) - 1)
+    ]
+
+    assert job_id is not None
+    assert len(heartbeat_times) >= 5
+    assert len(pre_claim_gaps) == 2
+    assert pre_claim_gaps[1] > pre_claim_gaps[0] * 1.5
+    assert len(post_claim_gaps) >= 1
+    assert min(post_claim_gaps) < backoff_max * 0.75
 
 
 async def test_mark_offline_sets_status(

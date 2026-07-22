@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     database_url: PostgresDsn
     lease_ttl_seconds: int = 30
     poll_interval_seconds: float = 1.0
+    poll_backoff_multiplier: float = 2.0
+    poll_backoff_max_seconds: float = 30.0
     worker_concurrency: int = 4
     log_level: str = "INFO"
     log_format: LogFormat = "json"
@@ -49,6 +51,20 @@ class Settings(BaseSettings):
     def poll_interval_positive(cls, v: float) -> float:
         if v <= 0:
             raise ValueError("poll_interval_seconds must be > 0")
+        return v
+
+    @field_validator("poll_backoff_multiplier")
+    @classmethod
+    def poll_backoff_multiplier_valid(cls, v: float) -> float:
+        if v < 1.0:
+            raise ValueError("poll_backoff_multiplier must be >= 1.0")
+        return v
+
+    @field_validator("poll_backoff_max_seconds")
+    @classmethod
+    def poll_backoff_max_positive(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("poll_backoff_max_seconds must be > 0")
         return v
 
     @field_validator("worker_concurrency")

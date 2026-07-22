@@ -16,7 +16,10 @@ from core.logging import (
     get_logger,
 )
 from core.models import Worker, WorkerStatus
+from worker.claim import claim_jobs
 from worker.cli import WorkerArgs, default_worker_name
+
+log = get_logger(__name__)
 
 
 async def register_worker(
@@ -71,16 +74,39 @@ async def mark_offline(session: AsyncSession, *, name: str) -> None:
 async def run_loop(
     *,
     name: str,
+    queues: list[str],
+    limit: int,
+    lease_seconds: int,
     poll_interval_seconds: float,
+    backoff_multiplier: float,
+    backoff_max_seconds: float,
     shutdown_event: asyncio.Event,
 ) -> None:
+    current_interval = poll_interval_seconds
     while not shutdown_event.is_set():
         async with get_session() as session:
             await heartbeat(session, name=name)
+        async with get_session() as session:
+            claimed = await claim_jobs(
+                session,
+                queues=queues,
+                worker_name=name,
+                limit=limit,
+                lease_seconds=lease_seconds,
+            )
+        if claimed:
+            log.debug("poll_claimed", count=len(claimed))
+            current_interval = poll_interval_seconds
+        else:
+            current_interval = min(
+                current_interval * backoff_multiplier,
+                backoff_max_seconds,
+            )
+            log.debug("poll_backoff", interval_seconds=current_interval)
         try:
             await asyncio.wait_for(
                 shutdown_event.wait(),
-                timeout=poll_interval_seconds,
+                timeout=current_interval,
             )
         except TimeoutError:
             continue
@@ -99,7 +125,6 @@ async def main(args: WorkerArgs) -> None:
         loop.add_signal_handler(sig, shutdown_event.set)
 
     hostname = socket.gethostname()
-    log = get_logger(__name__)
     log.info(
         "worker_starting",
         worker_name=worker_name,
@@ -118,7 +143,12 @@ async def main(args: WorkerArgs) -> None:
 
         await run_loop(
             name=worker_name,
+            queues=args.queues,
+            limit=args.concurrency,
+            lease_seconds=settings.lease_ttl_seconds,
             poll_interval_seconds=settings.poll_interval_seconds,
+            backoff_multiplier=settings.poll_backoff_multiplier,
+            backoff_max_seconds=settings.poll_backoff_max_seconds,
             shutdown_event=shutdown_event,
         )
     finally:
