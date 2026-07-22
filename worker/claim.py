@@ -20,6 +20,10 @@ async def claim_jobs(
     limit: int,
     lease_seconds: int,
 ) -> list[Job]:
+    """Claim due jobs with SKIP LOCKED select and atomic running/lock/lease transition.
+
+    Also increments attempts for each claimed job.
+    """
     if limit <= 0 or not queues:
         return []
     if lease_seconds <= 0:
