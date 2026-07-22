@@ -10,7 +10,7 @@ from core.config import get_settings
 from core.db import Base, dispose_engine, get_engine, get_sessionmaker
 from core.models import Job, JobStatus
 from tests.live_postgres import drop_metadata_tables, require_live_postgres_async
-from worker.claim import _CLAIMABLE_STATUSES, claim_jobs
+from worker.claim import _CLAIMABLE_STATUSES, claim_jobs, count_in_flight_jobs
 
 DEFAULT_LEASE_SECONDS = 30
 
@@ -63,6 +63,87 @@ async def _insert_job(
     await session.commit()
     await session.refresh(job)
     return job
+
+
+async def _insert_running_job(
+    session: AsyncSession,
+    *,
+    worker_name: str,
+    queue: str = "default",
+    lease_expires_at: datetime | None = None,
+) -> Job:
+    now = datetime.now(UTC)
+    job = Job(
+        queue=queue,
+        job_type="test",
+        payload_json={},
+        status=JobStatus.RUNNING.value,
+        priority=0,
+        next_run_at=now,
+        created_at=now,
+        locked_by=worker_name,
+        locked_at=now,
+        lease_expires_at=(
+            lease_expires_at or now + timedelta(seconds=DEFAULT_LEASE_SECONDS)
+        ),
+        attempts=1,
+    )
+    session.add(job)
+    await session.commit()
+    await session.refresh(job)
+    return job
+
+
+async def test_count_in_flight_jobs_counts_running_jobs_for_worker(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_claim_db() as session:
+        await _insert_running_job(session, worker_name="worker-1")
+        await _insert_running_job(session, worker_name="worker-1")
+        await _insert_running_job(session, worker_name="worker-2")
+
+    async with live_claim_db() as session:
+        count = await count_in_flight_jobs(session, worker_name="worker-1")
+
+    assert count == 2
+
+
+async def test_count_in_flight_jobs_excludes_other_workers(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_claim_db() as session:
+        await _insert_running_job(session, worker_name="worker-2")
+
+    async with live_claim_db() as session:
+        count = await count_in_flight_jobs(session, worker_name="worker-1")
+
+    assert count == 0
+
+
+async def test_count_in_flight_jobs_excludes_expired_leases(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    expired = datetime.now(UTC) - timedelta(seconds=1)
+    async with live_claim_db() as session:
+        await _insert_running_job(
+            session,
+            worker_name="worker-1",
+            lease_expires_at=expired,
+        )
+
+    async with live_claim_db() as session:
+        count = await count_in_flight_jobs(session, worker_name="worker-1")
+
+    assert count == 0
+
+
+async def test_count_in_flight_jobs_returns_zero_when_none(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_claim_db() as session:
+        count = await count_in_flight_jobs(session, worker_name="worker-1")
+
+    assert count == 0
 
 
 async def test_claim_jobs_orders_by_priority_next_run_at_created_at(

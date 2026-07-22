@@ -12,6 +12,23 @@ _CLAIMABLE_STATUSES = (
 )
 
 
+async def count_in_flight_jobs(
+    session: AsyncSession,
+    *,
+    worker_name: str,
+) -> int:
+    stmt = (
+        select(func.count())
+        .select_from(Job)
+        .where(
+            Job.locked_by == worker_name,
+            Job.status == JobStatus.RUNNING.value,
+            Job.lease_expires_at > func.now(),
+        )
+    )
+    return (await session.scalar(stmt)) or 0
+
+
 async def claim_jobs(
     session: AsyncSession,
     *,

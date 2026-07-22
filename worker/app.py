@@ -16,7 +16,7 @@ from core.logging import (
     get_logger,
 )
 from core.models import Worker, WorkerStatus
-from worker.claim import claim_jobs
+from worker.claim import claim_jobs, count_in_flight_jobs
 from worker.cli import WorkerArgs, default_worker_name
 
 log = get_logger(__name__)
@@ -87,11 +87,13 @@ async def run_loop(
         async with get_session() as session:
             await heartbeat(session, name=name)
         async with get_session() as session:
+            in_flight = await count_in_flight_jobs(session, worker_name=name)
+            remaining = max(0, limit - in_flight)
             claimed = await claim_jobs(
                 session,
                 queues=queues,
                 worker_name=name,
-                limit=limit,
+                limit=remaining,
                 lease_seconds=lease_seconds,
             )
         if claimed:

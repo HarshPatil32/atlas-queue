@@ -1,6 +1,6 @@
 import asyncio
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TypedDict
 
 import pytest
@@ -12,6 +12,7 @@ from core.db import Base, dispose_engine, get_engine, get_session, get_sessionma
 from core.models import Job, JobStatus, Worker, WorkerStatus
 from tests.live_postgres import drop_metadata_tables, require_live_postgres_async
 from worker.app import get_worker, heartbeat, mark_offline, register_worker, run_loop
+from worker.claim import count_in_flight_jobs
 
 DEFAULT_LEASE_SECONDS = 30
 
@@ -83,6 +84,35 @@ async def _insert_job(
         priority=0,
         next_run_at=now,
         created_at=now,
+    )
+    session.add(job)
+    await session.commit()
+    await session.refresh(job)
+    return job
+
+
+async def _insert_running_job(
+    session: AsyncSession,
+    *,
+    worker_name: str,
+    queue: str = "default",
+    lease_expires_at: datetime | None = None,
+) -> Job:
+    now = datetime.now(UTC)
+    job = Job(
+        queue=queue,
+        job_type="test",
+        payload_json={},
+        status=JobStatus.RUNNING.value,
+        priority=0,
+        next_run_at=now,
+        created_at=now,
+        locked_by=worker_name,
+        locked_at=now,
+        lease_expires_at=(
+            lease_expires_at or now + timedelta(seconds=DEFAULT_LEASE_SECONDS)
+        ),
+        attempts=1,
     )
     session.add(job)
     await session.commit()
@@ -407,6 +437,187 @@ async def test_run_loop_resets_backoff_after_claim(
     assert pre_claim_gaps[1] > pre_claim_gaps[0] * 1.5
     assert len(post_claim_gaps) >= 1
     assert min(post_claim_gaps) < backoff_max * 0.75
+
+
+async def test_run_loop_respects_concurrency_limit(
+    live_worker_db: async_sessionmaker[AsyncSession],
+) -> None:
+    worker_name = "worker-loop"
+    concurrency = 2
+
+    async with live_worker_db() as session:
+        await register_worker(
+            session,
+            name=worker_name,
+            hostname="host-a",
+            queues=["default"],
+        )
+        for _ in range(5):
+            await _insert_job(session)
+
+    shutdown_event = asyncio.Event()
+    max_in_flight = 0
+
+    async def watch_in_flight() -> None:
+        nonlocal max_in_flight
+        for _ in range(100):
+            async with get_session() as session:
+                in_flight = await count_in_flight_jobs(session, worker_name=worker_name)
+                max_in_flight = max(max_in_flight, in_flight)
+                if in_flight >= concurrency:
+                    shutdown_event.set()
+                    return
+            await asyncio.sleep(0.02)
+
+    stopper = asyncio.create_task(watch_in_flight())
+    try:
+        await asyncio.wait_for(
+            run_loop(
+                name=worker_name,
+                shutdown_event=shutdown_event,
+                queues=["default"],
+                limit=concurrency,
+                lease_seconds=DEFAULT_LEASE_SECONDS,
+                poll_interval_seconds=0.05,
+                backoff_multiplier=2.0,
+                backoff_max_seconds=1.0,
+            ),
+            timeout=5.0,
+        )
+    finally:
+        await _cancel_background_task(stopper)
+
+    async with live_worker_db() as session:
+        in_flight = await count_in_flight_jobs(session, worker_name=worker_name)
+        queued = (
+            await session.scalars(
+                select(Job).where(Job.status == JobStatus.QUEUED.value)
+            )
+        ).all()
+
+    assert shutdown_event.is_set()
+    assert max_in_flight <= concurrency
+    assert in_flight == concurrency
+    assert len(queued) == 5 - concurrency
+
+
+async def test_run_loop_claims_only_remaining_capacity(
+    live_worker_db: async_sessionmaker[AsyncSession],
+) -> None:
+    worker_name = "worker-loop"
+
+    async with live_worker_db() as session:
+        await register_worker(
+            session,
+            name=worker_name,
+            hostname="host-a",
+            queues=["default"],
+        )
+        await _insert_running_job(session, worker_name=worker_name)
+        for _ in range(3):
+            await _insert_job(session)
+
+    shutdown_event = asyncio.Event()
+
+    async def stop_at_capacity() -> None:
+        for _ in range(100):
+            async with get_session() as session:
+                in_flight = await count_in_flight_jobs(session, worker_name=worker_name)
+                if in_flight >= 2:
+                    shutdown_event.set()
+                    return
+            await asyncio.sleep(0.02)
+
+    stopper = asyncio.create_task(stop_at_capacity())
+    try:
+        await asyncio.wait_for(
+            run_loop(
+                name=worker_name,
+                shutdown_event=shutdown_event,
+                queues=["default"],
+                limit=2,
+                lease_seconds=DEFAULT_LEASE_SECONDS,
+                poll_interval_seconds=0.05,
+                backoff_multiplier=2.0,
+                backoff_max_seconds=1.0,
+            ),
+            timeout=5.0,
+        )
+    finally:
+        await _cancel_background_task(stopper)
+
+    async with live_worker_db() as session:
+        in_flight = await count_in_flight_jobs(session, worker_name=worker_name)
+        queued = (
+            await session.scalars(
+                select(Job).where(Job.status == JobStatus.QUEUED.value)
+            )
+        ).all()
+
+    assert in_flight == 2
+    assert len(queued) == 2
+
+
+async def test_run_loop_ignores_expired_in_flight_for_capacity(
+    live_worker_db: async_sessionmaker[AsyncSession],
+) -> None:
+    worker_name = "worker-loop"
+    expired = datetime.now(UTC) - timedelta(seconds=1)
+
+    async with live_worker_db() as session:
+        await register_worker(
+            session,
+            name=worker_name,
+            hostname="host-a",
+            queues=["default"],
+        )
+        await _insert_running_job(
+            session,
+            worker_name=worker_name,
+            lease_expires_at=expired,
+        )
+        queued_job = await _insert_job(session)
+
+    shutdown_event = asyncio.Event()
+
+    async def stop_after_new_claim() -> None:
+        for _ in range(100):
+            async with get_session() as session:
+                claimed_job = await session.scalar(
+                    select(Job).where(Job.id == queued_job.id)
+                )
+                if (
+                    claimed_job is not None
+                    and claimed_job.status == JobStatus.RUNNING.value
+                ):
+                    shutdown_event.set()
+                    return
+            await asyncio.sleep(0.02)
+
+    stopper = asyncio.create_task(stop_after_new_claim())
+    try:
+        await asyncio.wait_for(
+            run_loop(
+                name=worker_name,
+                shutdown_event=shutdown_event,
+                queues=["default"],
+                limit=1,
+                lease_seconds=DEFAULT_LEASE_SECONDS,
+                poll_interval_seconds=0.05,
+                backoff_multiplier=2.0,
+                backoff_max_seconds=1.0,
+            ),
+            timeout=5.0,
+        )
+    finally:
+        await _cancel_background_task(stopper)
+
+    async with live_worker_db() as session:
+        claimed_job = await session.scalar(select(Job).where(Job.id == queued_job.id))
+
+    assert claimed_job is not None
+    assert claimed_job.status == JobStatus.RUNNING.value
+    assert claimed_job.locked_by == worker_name
 
 
 async def test_mark_offline_sets_status(
