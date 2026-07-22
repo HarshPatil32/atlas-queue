@@ -3,7 +3,9 @@ import os
 
 import pytest
 from sqlalchemy import pool, text
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+
+from core.db import Base
 
 LIVE_MIGRATIONS_TEST_DATABASE_URL = "LIVE_MIGRATIONS_TEST_DATABASE_URL"
 DEFAULT_LIVE_TEST_DATABASE_URL = (
@@ -50,3 +52,10 @@ async def require_live_postgres_async() -> str:
             f"Start the dev test database with: {DEV_TEST_POSTGRES_COMMAND}"
         )
     return live_url
+
+
+async def drop_metadata_tables(engine: AsyncEngine) -> None:
+    """Drop ORM tables and Alembic state after metadata-only test setup."""
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.drop_all)
+        await connection.execute(text("DROP TABLE IF EXISTS alembic_version"))

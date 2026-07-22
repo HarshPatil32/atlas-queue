@@ -15,6 +15,8 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert str(settings.database_url) == DATABASE_URL
     assert settings.lease_ttl_seconds == 30
     assert settings.poll_interval_seconds == 1.0
+    assert settings.poll_backoff_multiplier == 2.0
+    assert settings.poll_backoff_max_seconds == 30.0
     assert settings.worker_concurrency == 4
     assert settings.log_level == "INFO"
     assert settings.log_format == "json"
@@ -47,6 +49,22 @@ def test_invalid_lease_ttl_raises(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_invalid_poll_interval_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
     monkeypatch.setenv("POLL_INTERVAL_SECONDS", "0")
+    with pytest.raises(ValidationError):
+        _settings()
+
+
+def test_invalid_poll_backoff_multiplier_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    monkeypatch.setenv("POLL_BACKOFF_MULTIPLIER", "0.5")
+    with pytest.raises(ValidationError):
+        _settings()
+
+
+def test_invalid_poll_backoff_max_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    monkeypatch.setenv("POLL_BACKOFF_MAX_SECONDS", "0")
     with pytest.raises(ValidationError):
         _settings()
 

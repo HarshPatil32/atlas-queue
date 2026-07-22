@@ -159,10 +159,12 @@ def test_job_polling_index() -> None:
     polling_index = _job_index("ix_jobs_queue_status_priority_next_run_at")
     assert [str(expression) for expression in polling_index.expressions] == [
         "jobs.queue",
-        "jobs.status",
         "priority DESC",
         "jobs.next_run_at",
+        "jobs.created_at",
     ]
+    where_clause = polling_index.dialect_options["postgresql"]["where"]
+    assert str(where_clause) == "status IN ('queued', 'scheduled', 'retrying')"
 
 
 def test_job_lease_reaper_index() -> None:

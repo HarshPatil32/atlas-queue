@@ -49,9 +49,10 @@ class Job(Base):
         Index(
             "ix_jobs_queue_status_priority_next_run_at",
             "queue",
-            "status",
             text("priority DESC"),
             "next_run_at",
+            "created_at",
+            postgresql_where=text("status IN ('queued', 'scheduled', 'retrying')"),
         ),
         Index("ix_jobs_status_lease_expires_at", "status", "lease_expires_at"),
     )
