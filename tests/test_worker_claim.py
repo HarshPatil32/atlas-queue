@@ -3,7 +3,7 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from core.config import get_settings
@@ -236,6 +236,37 @@ async def test_claim_jobs_skips_jobs_not_yet_due(
 
     assert len(claimed) == 1
     assert claimed[0].id == due.id
+
+
+async def test_claim_jobs_claims_job_at_exact_next_run_at(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_claim_db() as session:
+        db_now = await session.scalar(select(func.now()))
+        assert db_now is not None
+        at_now = Job(
+            queue="default",
+            job_type="test",
+            payload_json={},
+            status=JobStatus.QUEUED.value,
+            priority=0,
+            next_run_at=db_now,
+            created_at=db_now,
+        )
+        session.add(at_now)
+        # flush (not commit) keeps the transaction open so func.now() is stable
+        await session.flush()
+
+        claimed = await claim_jobs(
+            session,
+            queues=["default"],
+            worker_name="worker-1",
+            limit=10,
+            lease_seconds=DEFAULT_LEASE_SECONDS,
+        )
+
+    assert len(claimed) == 1
+    assert claimed[0].id == at_now.id
 
 
 async def test_claim_jobs_filters_by_queue(
