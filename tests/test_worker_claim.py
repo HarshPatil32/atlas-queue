@@ -10,7 +10,12 @@ from core.config import get_settings
 from core.db import Base, dispose_engine, get_engine, get_sessionmaker
 from core.models import Job, JobStatus
 from tests.live_postgres import drop_metadata_tables, require_live_postgres_async
-from worker.claim import _CLAIMABLE_STATUSES, claim_jobs, count_in_flight_jobs
+from worker.claim import (
+    _CLAIMABLE_STATUSES,
+    claim_jobs,
+    count_in_flight_jobs,
+    release_in_flight_jobs,
+)
 
 DEFAULT_LEASE_SECONDS = 30
 
@@ -465,3 +470,83 @@ async def test_concurrent_claim_jobs_do_not_double_claim(
     claimed_ids = {job.id for job in first_batch + second_batch}
     assert claimed_ids == {job.id for job in jobs}
     assert len(claimed_ids) == len(jobs)
+
+
+async def test_release_in_flight_jobs_returns_running_jobs_to_queued(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_claim_db() as session:
+        job_one = await _insert_running_job(session, worker_name="worker-1")
+        job_two = await _insert_running_job(session, worker_name="worker-1")
+
+    async with live_claim_db() as session:
+        released = await release_in_flight_jobs(session, worker_name="worker-1")
+
+    assert released == 2
+
+    async with live_claim_db() as session:
+        released_one = await session.scalar(select(Job).where(Job.id == job_one.id))
+        released_two = await session.scalar(select(Job).where(Job.id == job_two.id))
+
+    assert released_one is not None
+    assert released_one.status == JobStatus.QUEUED.value
+    assert released_one.locked_by is None
+    assert released_one.locked_at is None
+    assert released_one.lease_expires_at is None
+
+    assert released_two is not None
+    assert released_two.status == JobStatus.QUEUED.value
+    assert released_two.locked_by is None
+    assert released_two.locked_at is None
+    assert released_two.lease_expires_at is None
+
+
+async def test_release_in_flight_jobs_ignores_other_workers(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_claim_db() as session:
+        other_worker_job = await _insert_running_job(session, worker_name="worker-2")
+        await _insert_running_job(session, worker_name="worker-1")
+
+    async with live_claim_db() as session:
+        released = await release_in_flight_jobs(session, worker_name="worker-1")
+
+    assert released == 1
+
+    async with live_claim_db() as session:
+        other_job = await session.scalar(
+            select(Job).where(Job.id == other_worker_job.id)
+        )
+
+    assert other_job is not None
+    assert other_job.status == JobStatus.RUNNING.value
+    assert other_job.locked_by == "worker-2"
+
+
+async def test_release_in_flight_jobs_ignores_non_running_statuses(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_claim_db() as session:
+        queued = await _insert_job(session, status=JobStatus.QUEUED.value)
+        await _insert_running_job(session, worker_name="worker-1")
+
+    async with live_claim_db() as session:
+        released = await release_in_flight_jobs(session, worker_name="worker-1")
+
+    assert released == 1
+
+    async with live_claim_db() as session:
+        unchanged = await session.scalar(select(Job).where(Job.id == queued.id))
+
+    assert unchanged is not None
+    assert unchanged.status == JobStatus.QUEUED.value
+    assert unchanged.locked_by is None
+
+
+async def test_release_in_flight_jobs_returns_zero_when_none(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_claim_db() as session:
+        released = await release_in_flight_jobs(session, worker_name="worker-1")
+
+    assert released == 0

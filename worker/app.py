@@ -16,7 +16,7 @@ from core.logging import (
     get_logger,
 )
 from core.models import Worker, WorkerStatus
-from worker.claim import claim_jobs, count_in_flight_jobs
+from worker.claim import claim_jobs, count_in_flight_jobs, release_in_flight_jobs
 from worker.cli import WorkerArgs, default_worker_name
 
 log = get_logger(__name__)
@@ -154,6 +154,15 @@ async def main(args: WorkerArgs) -> None:
             shutdown_event=shutdown_event,
         )
     finally:
+        try:
+            async with get_session() as session:
+                released = await release_in_flight_jobs(
+                    session, worker_name=worker_name
+                )
+            if released:
+                log.info("worker_released_jobs", count=released)
+        except Exception:
+            log.exception("worker_release_jobs_failed")
         try:
             async with get_session() as session:
                 await mark_offline(session, name=worker_name)

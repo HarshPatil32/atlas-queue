@@ -89,3 +89,34 @@ async def claim_jobs(
     }
     await session.commit()
     return [claimed_by_id[job_id] for job_id in job_ids if job_id in claimed_by_id]
+
+
+async def release_in_flight_jobs(
+    session: AsyncSession,
+    *,
+    worker_name: str,
+) -> int:
+    """Return this worker's running jobs to queued (graceful shutdown).
+
+    Does not decrement attempts (incremented at claim) or change next_run_at;
+    retry vs shutdown semantics for those fields belong in Epic 7.
+    """
+    stmt = (
+        update(Job)
+        .where(
+            Job.locked_by == worker_name,
+            Job.status == JobStatus.RUNNING.value,
+        )
+        .values(
+            status=JobStatus.QUEUED.value,
+            locked_by=None,
+            locked_at=None,
+            lease_expires_at=None,
+            updated_at=func.now(),
+        )
+        .returning(Job.id)
+    )
+    result = await session.execute(stmt)
+    released_count = len(result.scalars().all())
+    await session.commit()
+    return released_count

@@ -11,8 +11,16 @@ from core.config import get_settings
 from core.db import Base, dispose_engine, get_engine, get_session, get_sessionmaker
 from core.models import Job, JobStatus, Worker, WorkerStatus
 from tests.live_postgres import drop_metadata_tables, require_live_postgres_async
-from worker.app import get_worker, heartbeat, mark_offline, register_worker, run_loop
-from worker.claim import count_in_flight_jobs
+from worker.app import (
+    get_worker,
+    heartbeat,
+    main,
+    mark_offline,
+    register_worker,
+    run_loop,
+)
+from worker.claim import claim_jobs, count_in_flight_jobs
+from worker.cli import WorkerArgs
 
 DEFAULT_LEASE_SECONDS = 30
 
@@ -306,6 +314,53 @@ async def test_run_loop_claims_available_job(
     assert claimed_job is not None
     assert claimed_job.status == JobStatus.RUNNING.value
     assert claimed_job.locked_by == "worker-loop"
+
+
+async def test_main_shutdown_releases_claimed_jobs_and_marks_offline(
+    live_worker_db: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker_name = "worker-main-shutdown"
+
+    async with live_worker_db() as session:
+        job = await _insert_job(session)
+
+    async def claim_then_shutdown(
+        *,
+        name: str,
+        queues: list[str],
+        limit: int,
+        lease_seconds: int,
+        poll_interval_seconds: float,
+        backoff_multiplier: float,
+        backoff_max_seconds: float,
+        shutdown_event: asyncio.Event,
+    ) -> None:
+        async with get_session() as session:
+            await claim_jobs(
+                session,
+                queues=queues,
+                worker_name=name,
+                limit=limit,
+                lease_seconds=lease_seconds,
+            )
+        shutdown_event.set()
+
+    monkeypatch.setattr("worker.app.run_loop", claim_then_shutdown)
+
+    await main(WorkerArgs(queues=["default"], concurrency=1, name=worker_name))
+
+    async with live_worker_db() as session:
+        released_job = await session.scalar(select(Job).where(Job.id == job.id))
+        worker = await get_worker(session, name=worker_name)
+
+    assert released_job is not None
+    assert released_job.status == JobStatus.QUEUED.value
+    assert released_job.locked_by is None
+    assert released_job.locked_at is None
+    assert released_job.lease_expires_at is None
+    assert worker is not None
+    assert worker.status == WorkerStatus.OFFLINE.value
 
 
 async def test_run_loop_backs_off_when_queue_empty(
