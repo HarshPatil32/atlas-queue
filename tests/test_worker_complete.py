@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from core.config import get_settings
 from core.db import Base, dispose_engine, get_engine, get_sessionmaker
 from core.models import Job, JobAttempt, JobAttemptStatus, JobStatus
+from core.registry import UnknownJobTypeError
 from tests.live_postgres import drop_metadata_tables, require_live_postgres_async
 from worker.complete import mark_job_failed, mark_job_succeeded
 from worker.execute import JobExecutionResult
@@ -198,6 +199,44 @@ async def test_mark_job_succeeded_ignores_job_owned_by_other_worker(
     assert unchanged.status == JobStatus.RUNNING.value
     assert unchanged.locked_by == "worker-2"
     assert attempt is None
+
+
+async def test_mark_job_failed_handles_unknown_job_type_error(
+    live_complete_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_complete_db() as session:
+        job = await _insert_running_job(
+            session,
+            worker_name=WORKER_NAME,
+            attempts=1,
+            max_retries=3,
+        )
+        original_next_run_at = job.next_run_at
+
+    error = UnknownJobTypeError("missing")
+    async with live_complete_db() as session:
+        await mark_job_failed(
+            session,
+            outcome=_failed_outcome(job, error=error),
+            worker_name=WORKER_NAME,
+        )
+
+    async with live_complete_db() as session:
+        updated = await session.scalar(select(Job).where(Job.id == job.id))
+        attempt = await session.scalar(
+            select(JobAttempt).where(JobAttempt.job_id == job.id)
+        )
+
+    assert updated is not None
+    assert updated.status == JobStatus.RETRYING.value
+    assert updated.last_error == "unknown job_type: 'missing'"
+    assert updated.failed_at is None
+    assert updated.next_run_at > original_next_run_at
+
+    assert attempt is not None
+    assert attempt.status == JobAttemptStatus.FAILED.value
+    assert attempt.error_message == "unknown job_type: 'missing'"
+    assert attempt.attempt_number == job.attempts
 
 
 async def test_mark_job_failed_retries_when_attempts_below_max(
