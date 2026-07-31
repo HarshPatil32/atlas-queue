@@ -1,7 +1,7 @@
 import logging
 from functools import lru_cache
 
-from pydantic import PostgresDsn, field_validator
+from pydantic import PostgresDsn, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from core.logging import LogFormat
@@ -16,9 +16,11 @@ class Settings(BaseSettings):
 
     database_url: PostgresDsn
     lease_ttl_seconds: int = 30
+    lease_heartbeat_interval_seconds: float = 10.0
     poll_interval_seconds: float = 1.0
     poll_backoff_multiplier: float = 2.0
     poll_backoff_max_seconds: float = 30.0
+    reaper_interval_seconds: float = 30.0
     worker_concurrency: int = 4
     log_level: str = "INFO"
     log_format: LogFormat = "json"
@@ -46,6 +48,13 @@ class Settings(BaseSettings):
             raise ValueError("lease_ttl_seconds must be > 0")
         return v
 
+    @field_validator("lease_heartbeat_interval_seconds")
+    @classmethod
+    def lease_heartbeat_interval_positive(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("lease_heartbeat_interval_seconds must be > 0")
+        return v
+
     @field_validator("poll_interval_seconds")
     @classmethod
     def poll_interval_positive(cls, v: float) -> float:
@@ -67,12 +76,27 @@ class Settings(BaseSettings):
             raise ValueError("poll_backoff_max_seconds must be > 0")
         return v
 
+    @field_validator("reaper_interval_seconds")
+    @classmethod
+    def reaper_interval_positive(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("reaper_interval_seconds must be > 0")
+        return v
+
     @field_validator("worker_concurrency")
     @classmethod
     def concurrency_positive(cls, v: int) -> int:
         if v <= 0:
             raise ValueError("worker_concurrency must be > 0")
         return v
+
+    @model_validator(mode="after")
+    def lease_heartbeat_interval_less_than_ttl(self) -> "Settings":
+        if self.lease_heartbeat_interval_seconds >= self.lease_ttl_seconds:
+            raise ValueError(
+                "lease_heartbeat_interval_seconds must be < lease_ttl_seconds"
+            )
+        return self
 
 
 @lru_cache(maxsize=1)

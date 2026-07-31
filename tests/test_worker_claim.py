@@ -8,12 +8,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from core.config import get_settings
 from core.db import Base, dispose_engine, get_engine, get_sessionmaker
-from core.models import Job, JobStatus
+from core.models import Job, JobAttempt, JobAttemptStatus, JobStatus
 from tests.live_postgres import drop_metadata_tables, require_live_postgres_async
 from worker.claim import (
     _CLAIMABLE_STATUSES,
     claim_jobs,
     count_in_flight_jobs,
+    extend_lease,
+    reap_expired_jobs,
     release_in_flight_jobs,
 )
 
@@ -76,6 +78,8 @@ async def _insert_running_job(
     worker_name: str,
     queue: str = "default",
     lease_expires_at: datetime | None = None,
+    attempts: int = 1,
+    max_retries: int = 3,
 ) -> Job:
     now = datetime.now(UTC)
     job = Job(
@@ -91,7 +95,8 @@ async def _insert_running_job(
         lease_expires_at=(
             lease_expires_at or now + timedelta(seconds=DEFAULT_LEASE_SECONDS)
         ),
-        attempts=1,
+        attempts=attempts,
+        max_retries=max_retries,
     )
     session.add(job)
     await session.commit()
@@ -550,3 +555,336 @@ async def test_release_in_flight_jobs_returns_zero_when_none(
         released = await release_in_flight_jobs(session, worker_name="worker-1")
 
     assert released == 0
+
+
+async def test_extend_lease_extends_lease_expires_at(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_claim_db() as session:
+        job = await _insert_running_job(session, worker_name="worker-1")
+        original_expiry = job.lease_expires_at
+        assert original_expiry is not None
+
+    async with live_claim_db() as session:
+        extended = await extend_lease(
+            session,
+            job_id=job.id,
+            worker_name="worker-1",
+            lease_seconds=DEFAULT_LEASE_SECONDS,
+        )
+
+    assert extended is True
+
+    async with live_claim_db() as session:
+        updated = await session.scalar(select(Job).where(Job.id == job.id))
+
+    assert updated is not None
+    assert updated.lease_expires_at is not None
+    assert updated.lease_expires_at > original_expiry
+
+
+async def test_extend_lease_ignores_job_owned_by_other_worker(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_claim_db() as session:
+        job = await _insert_running_job(session, worker_name="worker-1")
+        original_expiry = job.lease_expires_at
+
+    async with live_claim_db() as session:
+        extended = await extend_lease(
+            session,
+            job_id=job.id,
+            worker_name="worker-2",
+            lease_seconds=DEFAULT_LEASE_SECONDS,
+        )
+
+    assert extended is False
+
+    async with live_claim_db() as session:
+        unchanged = await session.scalar(select(Job).where(Job.id == job.id))
+
+    assert unchanged is not None
+    assert unchanged.lease_expires_at == original_expiry
+
+
+async def test_extend_lease_ignores_non_running_job(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_claim_db() as session:
+        job = await _insert_job(session, status=JobStatus.QUEUED.value)
+
+    async with live_claim_db() as session:
+        extended = await extend_lease(
+            session,
+            job_id=job.id,
+            worker_name="worker-1",
+            lease_seconds=DEFAULT_LEASE_SECONDS,
+        )
+
+    assert extended is False
+
+
+async def test_extend_lease_ignores_expired_lease(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    expired = datetime.now(UTC) - timedelta(seconds=1)
+    async with live_claim_db() as session:
+        job = await _insert_running_job(
+            session,
+            worker_name="worker-1",
+            lease_expires_at=expired,
+        )
+        original_expiry = job.lease_expires_at
+
+    async with live_claim_db() as session:
+        extended = await extend_lease(
+            session,
+            job_id=job.id,
+            worker_name="worker-1",
+            lease_seconds=DEFAULT_LEASE_SECONDS,
+        )
+
+    assert extended is False
+
+    async with live_claim_db() as session:
+        unchanged = await session.scalar(select(Job).where(Job.id == job.id))
+
+    assert unchanged is not None
+    assert unchanged.lease_expires_at == original_expiry
+
+
+async def test_extend_lease_returns_false_for_missing_job(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_claim_db() as session:
+        extended = await extend_lease(
+            session,
+            job_id=999999,
+            worker_name="worker-1",
+            lease_seconds=DEFAULT_LEASE_SECONDS,
+        )
+
+    assert extended is False
+
+
+async def test_extend_lease_rejects_non_positive_lease_seconds(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_claim_db() as session:
+        job = await _insert_running_job(session, worker_name="worker-1")
+
+    async with live_claim_db() as session:
+        with pytest.raises(ValueError, match="lease_seconds must be > 0"):
+            await extend_lease(
+                session,
+                job_id=job.id,
+                worker_name="worker-1",
+                lease_seconds=0,
+            )
+
+
+async def test_reap_expired_jobs_retries_job_under_max_retries(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    expired = datetime.now(UTC) - timedelta(seconds=1)
+    async with live_claim_db() as session:
+        job = await _insert_running_job(
+            session,
+            worker_name="dead-worker",
+            lease_expires_at=expired,
+            attempts=1,
+            max_retries=3,
+        )
+
+    async with live_claim_db() as session:
+        reaped = await reap_expired_jobs(session)
+
+    assert reaped == 1
+
+    async with live_claim_db() as session:
+        updated = await session.scalar(select(Job).where(Job.id == job.id))
+        attempt = await session.scalar(
+            select(JobAttempt).where(
+                JobAttempt.job_id == job.id,
+                JobAttempt.attempt_number == 1,
+            )
+        )
+
+    assert updated is not None
+    assert updated.status == JobStatus.RETRYING.value
+    assert updated.locked_by is None
+    assert updated.locked_at is None
+    assert updated.lease_expires_at is None
+    assert updated.last_error == "lease expired: worker did not renew in time"
+    assert updated.next_run_at is not None
+    assert attempt is not None
+    assert attempt.status == JobAttemptStatus.FAILED.value
+    assert attempt.worker_id == "dead-worker"
+
+
+async def test_reap_expired_jobs_fails_job_at_max_retries(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    expired = datetime.now(UTC) - timedelta(seconds=1)
+    async with live_claim_db() as session:
+        job = await _insert_running_job(
+            session,
+            worker_name="dead-worker",
+            lease_expires_at=expired,
+            attempts=3,
+            max_retries=3,
+        )
+        original_next_run_at = job.next_run_at
+
+    async with live_claim_db() as session:
+        reaped = await reap_expired_jobs(session)
+
+    assert reaped == 1
+
+    async with live_claim_db() as session:
+        updated = await session.scalar(select(Job).where(Job.id == job.id))
+        attempt = await session.scalar(
+            select(JobAttempt).where(
+                JobAttempt.job_id == job.id,
+                JobAttempt.attempt_number == 3,
+            )
+        )
+
+    assert updated is not None
+    assert updated.status == JobStatus.FAILED.value
+    assert updated.failed_at is not None
+    assert updated.next_run_at == original_next_run_at
+    assert attempt is not None
+    assert attempt.status == JobAttemptStatus.FAILED.value
+    assert attempt.worker_id == "dead-worker"
+
+
+async def test_reap_expired_jobs_ignores_non_expired_leases(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_claim_db() as session:
+        await _insert_running_job(session, worker_name="worker-1")
+
+    async with live_claim_db() as session:
+        reaped = await reap_expired_jobs(session)
+
+    assert reaped == 0
+
+
+async def test_reap_expired_jobs_only_touches_running_status(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    expired = datetime.now(UTC) - timedelta(seconds=1)
+    async with live_claim_db() as session:
+        queued = await _insert_job(session, status=JobStatus.QUEUED.value)
+        await _insert_running_job(
+            session,
+            worker_name="dead-worker",
+            lease_expires_at=expired,
+        )
+
+    async with live_claim_db() as session:
+        reaped = await reap_expired_jobs(session)
+
+    assert reaped == 1
+
+    async with live_claim_db() as session:
+        unchanged = await session.scalar(select(Job).where(Job.id == queued.id))
+
+    assert unchanged is not None
+    assert unchanged.status == JobStatus.QUEUED.value
+
+
+async def test_reap_expired_jobs_respects_limit(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    expired = datetime.now(UTC) - timedelta(seconds=1)
+    async with live_claim_db() as session:
+        jobs = [
+            await _insert_running_job(
+                session,
+                worker_name="dead-worker",
+                lease_expires_at=expired,
+            )
+            for _ in range(3)
+        ]
+
+    async with live_claim_db() as session:
+        reaped = await reap_expired_jobs(session, limit=2)
+
+    assert reaped == 2
+
+    async with live_claim_db() as session:
+        statuses = {
+            job.id: (await session.scalar(select(Job.status).where(Job.id == job.id)))
+            for job in jobs
+        }
+
+    reaped_statuses = [
+        status
+        for job_id, status in statuses.items()
+        if status in (JobStatus.RETRYING.value, JobStatus.FAILED.value)
+    ]
+    still_running = [
+        job_id
+        for job_id, status in statuses.items()
+        if status == JobStatus.RUNNING.value
+    ]
+    assert len(reaped_statuses) == 2
+    assert len(still_running) == 1
+
+
+async def test_reap_expired_jobs_returns_zero_when_limit_is_zero(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    expired = datetime.now(UTC) - timedelta(seconds=1)
+    async with live_claim_db() as session:
+        await _insert_running_job(
+            session,
+            worker_name="dead-worker",
+            lease_expires_at=expired,
+        )
+
+    async with live_claim_db() as session:
+        reaped = await reap_expired_jobs(session, limit=0)
+
+    assert reaped == 0
+
+    async with live_claim_db() as session:
+        still_running = (
+            await session.scalars(
+                select(Job).where(Job.status == JobStatus.RUNNING.value)
+            )
+        ).all()
+
+    assert len(still_running) == 1
+
+
+async def test_reap_expired_jobs_returns_zero_when_none(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_claim_db() as session:
+        reaped = await reap_expired_jobs(session)
+
+    assert reaped == 0
+
+
+async def test_concurrent_reap_expired_jobs_do_not_double_reap(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    expired = datetime.now(UTC) - timedelta(seconds=1)
+    async with live_claim_db() as session:
+        for _ in range(4):
+            await _insert_running_job(
+                session,
+                worker_name="dead-worker",
+                lease_expires_at=expired,
+            )
+
+    async def reap_batch() -> int:
+        async with live_claim_db() as session:
+            return await reap_expired_jobs(session, limit=4)
+
+    first_count, second_count = await asyncio.gather(reap_batch(), reap_batch())
+
+    assert first_count + second_count == 4

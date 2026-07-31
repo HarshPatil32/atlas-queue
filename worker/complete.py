@@ -9,7 +9,7 @@ from worker.execute import JobExecutionResult
 _MAX_RETRY_DELAY_SECONDS: int = 300
 
 
-def _retry_delay_seconds(attempts: int) -> int:
+def retry_delay_seconds(attempts: int) -> int:
     exponential_delay = 1 << attempts
     if exponential_delay > _MAX_RETRY_DELAY_SECONDS:
         return _MAX_RETRY_DELAY_SECONDS
@@ -80,7 +80,7 @@ async def mark_job_failed(
     }
     if will_retry:
         retry_interval = text("make_interval(secs => :retry_delay_seconds)").bindparams(
-            retry_delay_seconds=_retry_delay_seconds(job.attempts),
+            retry_delay_seconds=retry_delay_seconds(job.attempts),
         )
         values["next_run_at"] = now + retry_interval
     else:

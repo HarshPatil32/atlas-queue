@@ -14,9 +14,11 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = _settings()
     assert str(settings.database_url) == DATABASE_URL
     assert settings.lease_ttl_seconds == 30
+    assert settings.lease_heartbeat_interval_seconds == 10.0
     assert settings.poll_interval_seconds == 1.0
     assert settings.poll_backoff_multiplier == 2.0
     assert settings.poll_backoff_max_seconds == 30.0
+    assert settings.reaper_interval_seconds == 30.0
     assert settings.worker_concurrency == 4
     assert settings.log_level == "INFO"
     assert settings.log_format == "json"
@@ -46,9 +48,42 @@ def test_invalid_lease_ttl_raises(monkeypatch: pytest.MonkeyPatch) -> None:
         _settings()
 
 
+def test_invalid_lease_heartbeat_interval_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    monkeypatch.setenv("LEASE_HEARTBEAT_INTERVAL_SECONDS", "0")
+    with pytest.raises(ValidationError):
+        _settings()
+
+
+def test_lease_heartbeat_interval_must_be_less_than_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    monkeypatch.setenv("LEASE_TTL_SECONDS", "30")
+    monkeypatch.setenv("LEASE_HEARTBEAT_INTERVAL_SECONDS", "30")
+    with pytest.raises(ValidationError):
+        _settings()
+
+
 def test_invalid_poll_interval_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
     monkeypatch.setenv("POLL_INTERVAL_SECONDS", "0")
+    with pytest.raises(ValidationError):
+        _settings()
+
+
+def test_reaper_interval_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    monkeypatch.setenv("REAPER_INTERVAL_SECONDS", "15.0")
+    settings = _settings()
+    assert settings.reaper_interval_seconds == 15.0
+
+
+def test_invalid_reaper_interval_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    monkeypatch.setenv("REAPER_INTERVAL_SECONDS", "0")
     with pytest.raises(ValidationError):
         _settings()
 

@@ -1,17 +1,19 @@
 import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
-from typing import TypedDict
+from typing import TypedDict, Unpack
 
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from structlog.testing import capture_logs
 
 from core.config import get_settings
 from core.db import Base, dispose_engine, get_engine, get_session, get_sessionmaker
 from core.models import Job, JobStatus, Worker, WorkerStatus
 from tests.live_postgres import drop_metadata_tables, require_live_postgres_async
 from worker.app import (
+    _cancel_heartbeat_tasks,
     get_worker,
     heartbeat,
     main,
@@ -29,18 +31,22 @@ class RunLoopKwargs(TypedDict):
     queues: list[str]
     limit: int
     lease_seconds: int
+    lease_heartbeat_interval_seconds: float
     poll_interval_seconds: float
     backoff_multiplier: float
     backoff_max_seconds: float
+    reaper_interval_seconds: float
 
 
 DEFAULT_RUN_LOOP_KWARGS: RunLoopKwargs = {
     "queues": ["default"],
     "limit": 1,
     "lease_seconds": DEFAULT_LEASE_SECONDS,
+    "lease_heartbeat_interval_seconds": 0.05,
     "poll_interval_seconds": 0.05,
     "backoff_multiplier": 2.0,
     "backoff_max_seconds": 1.0,
+    "reaper_interval_seconds": 0.05,
 }
 
 
@@ -50,6 +56,24 @@ async def _cancel_background_task(task: asyncio.Task[object]) -> None:
         await task
     except asyncio.CancelledError:
         pass
+
+
+async def _run_loop(
+    *,
+    name: str,
+    shutdown_event: asyncio.Event,
+    **kwargs: Unpack[RunLoopKwargs],
+) -> None:
+    heartbeat_tasks: dict[int, asyncio.Task[None]] = {}
+    try:
+        await run_loop(
+            name=name,
+            shutdown_event=shutdown_event,
+            heartbeat_tasks=heartbeat_tasks,
+            **kwargs,
+        )
+    finally:
+        await _cancel_heartbeat_tasks(heartbeat_tasks)
 
 
 @pytest.fixture
@@ -105,6 +129,8 @@ async def _insert_running_job(
     worker_name: str,
     queue: str = "default",
     lease_expires_at: datetime | None = None,
+    attempts: int = 1,
+    max_retries: int = 3,
 ) -> Job:
     now = datetime.now(UTC)
     job = Job(
@@ -120,7 +146,8 @@ async def _insert_running_job(
         lease_expires_at=(
             lease_expires_at or now + timedelta(seconds=DEFAULT_LEASE_SECONDS)
         ),
-        attempts=1,
+        attempts=attempts,
+        max_retries=max_retries,
     )
     session.add(job)
     await session.commit()
@@ -252,7 +279,7 @@ async def test_run_loop_updates_heartbeat_until_shutdown(
     stopper = asyncio.create_task(stop_after_loop_heartbeat())
     try:
         await asyncio.wait_for(
-            run_loop(
+            _run_loop(
                 name="worker-loop",
                 shutdown_event=shutdown_event,
                 **DEFAULT_RUN_LOOP_KWARGS,
@@ -298,7 +325,7 @@ async def test_run_loop_claims_available_job(
     stopper = asyncio.create_task(stop_after_claim())
     try:
         await asyncio.wait_for(
-            run_loop(
+            _run_loop(
                 name="worker-loop",
                 shutdown_event=shutdown_event,
                 **DEFAULT_RUN_LOOP_KWARGS,
@@ -331,10 +358,13 @@ async def test_main_shutdown_releases_claimed_jobs_and_marks_offline(
         queues: list[str],
         limit: int,
         lease_seconds: int,
+        lease_heartbeat_interval_seconds: float,
         poll_interval_seconds: float,
         backoff_multiplier: float,
         backoff_max_seconds: float,
+        reaper_interval_seconds: float,
         shutdown_event: asyncio.Event,
+        heartbeat_tasks: dict[int, asyncio.Task[None]],
     ) -> None:
         async with get_session() as session:
             await claim_jobs(
@@ -395,7 +425,7 @@ async def test_run_loop_backs_off_when_queue_empty(
     stopper = asyncio.create_task(record_heartbeats())
     try:
         await asyncio.wait_for(
-            run_loop(
+            _run_loop(
                 name="worker-loop",
                 shutdown_event=shutdown_event,
                 **DEFAULT_RUN_LOOP_KWARGS,
@@ -463,15 +493,17 @@ async def test_run_loop_resets_backoff_after_claim(
     stopper = asyncio.create_task(watch_loop())
     try:
         await asyncio.wait_for(
-            run_loop(
+            _run_loop(
                 name="worker-loop",
                 shutdown_event=shutdown_event,
                 queues=["default"],
                 limit=1,
                 lease_seconds=DEFAULT_LEASE_SECONDS,
+                lease_heartbeat_interval_seconds=0.05,
                 poll_interval_seconds=poll_interval,
                 backoff_multiplier=2.0,
                 backoff_max_seconds=backoff_max,
+                reaper_interval_seconds=0.05,
             ),
             timeout=5.0,
         )
@@ -527,15 +559,17 @@ async def test_run_loop_respects_concurrency_limit(
     stopper = asyncio.create_task(watch_in_flight())
     try:
         await asyncio.wait_for(
-            run_loop(
+            _run_loop(
                 name=worker_name,
                 shutdown_event=shutdown_event,
                 queues=["default"],
                 limit=concurrency,
                 lease_seconds=DEFAULT_LEASE_SECONDS,
+                lease_heartbeat_interval_seconds=0.05,
                 poll_interval_seconds=0.05,
                 backoff_multiplier=2.0,
                 backoff_max_seconds=1.0,
+                reaper_interval_seconds=0.05,
             ),
             timeout=5.0,
         )
@@ -586,15 +620,17 @@ async def test_run_loop_claims_only_remaining_capacity(
     stopper = asyncio.create_task(stop_at_capacity())
     try:
         await asyncio.wait_for(
-            run_loop(
+            _run_loop(
                 name=worker_name,
                 shutdown_event=shutdown_event,
                 queues=["default"],
                 limit=2,
                 lease_seconds=DEFAULT_LEASE_SECONDS,
+                lease_heartbeat_interval_seconds=0.05,
                 poll_interval_seconds=0.05,
                 backoff_multiplier=2.0,
                 backoff_max_seconds=1.0,
+                reaper_interval_seconds=0.05,
             ),
             timeout=5.0,
         )
@@ -652,15 +688,17 @@ async def test_run_loop_ignores_expired_in_flight_for_capacity(
     stopper = asyncio.create_task(stop_after_new_claim())
     try:
         await asyncio.wait_for(
-            run_loop(
+            _run_loop(
                 name=worker_name,
                 shutdown_event=shutdown_event,
                 queues=["default"],
                 limit=1,
                 lease_seconds=DEFAULT_LEASE_SECONDS,
+                lease_heartbeat_interval_seconds=0.05,
                 poll_interval_seconds=0.05,
                 backoff_multiplier=2.0,
                 backoff_max_seconds=1.0,
+                reaper_interval_seconds=0.05,
             ),
             timeout=5.0,
         )
@@ -673,6 +711,188 @@ async def test_run_loop_ignores_expired_in_flight_for_capacity(
     assert claimed_job is not None
     assert claimed_job.status == JobStatus.RUNNING.value
     assert claimed_job.locked_by == worker_name
+
+
+async def test_run_loop_extends_job_lease_while_in_flight(
+    live_worker_db: async_sessionmaker[AsyncSession],
+) -> None:
+    worker_name = "worker-loop"
+    lease_seconds = 1
+    heartbeat_interval = 0.2
+
+    async with live_worker_db() as session:
+        await register_worker(
+            session,
+            name=worker_name,
+            hostname="host-a",
+            queues=["default"],
+        )
+        job = await _insert_job(session)
+
+    shutdown_event = asyncio.Event()
+    original_expiry: datetime | None = None
+
+    async def wait_for_lease_extension() -> None:
+        nonlocal original_expiry
+        for _ in range(100):
+            async with get_session() as session:
+                claimed_job = await session.scalar(select(Job).where(Job.id == job.id))
+                if claimed_job is None:
+                    await asyncio.sleep(0.02)
+                    continue
+
+                if (
+                    claimed_job.status == JobStatus.RUNNING.value
+                    and claimed_job.locked_by == worker_name
+                ):
+                    if original_expiry is None:
+                        original_expiry = claimed_job.lease_expires_at
+                    elif (
+                        claimed_job.lease_expires_at is not None
+                        and original_expiry is not None
+                        and claimed_job.lease_expires_at > original_expiry
+                    ):
+                        shutdown_event.set()
+                        return
+            await asyncio.sleep(0.02)
+
+    stopper = asyncio.create_task(wait_for_lease_extension())
+    try:
+        await asyncio.wait_for(
+            _run_loop(
+                name=worker_name,
+                shutdown_event=shutdown_event,
+                queues=["default"],
+                limit=1,
+                lease_seconds=lease_seconds,
+                lease_heartbeat_interval_seconds=heartbeat_interval,
+                poll_interval_seconds=0.05,
+                backoff_multiplier=2.0,
+                backoff_max_seconds=1.0,
+                reaper_interval_seconds=0.05,
+            ),
+            timeout=5.0,
+        )
+    finally:
+        await _cancel_background_task(stopper)
+
+    assert original_expiry is not None
+    assert shutdown_event.is_set()
+
+
+async def test_run_loop_logs_when_job_lease_heartbeat_fails(
+    live_worker_db: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker_name = "worker-loop"
+
+    async with live_worker_db() as session:
+        await register_worker(
+            session,
+            name=worker_name,
+            hostname="host-a",
+            queues=["default"],
+        )
+        job = await _insert_job(session)
+
+    shutdown_event = asyncio.Event()
+    heartbeat_failed = asyncio.Event()
+
+    async def failing_extend_lease(*args: object, **kwargs: object) -> bool:
+        heartbeat_failed.set()
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr("worker.app.extend_lease", failing_extend_lease)
+
+    async def stop_after_heartbeat_failure() -> None:
+        await heartbeat_failed.wait()
+        shutdown_event.set()
+
+    stopper = asyncio.create_task(stop_after_heartbeat_failure())
+    try:
+        with capture_logs() as cap_logs:
+            await asyncio.wait_for(
+                _run_loop(
+                    name=worker_name,
+                    shutdown_event=shutdown_event,
+                    queues=["default"],
+                    limit=1,
+                    lease_seconds=DEFAULT_LEASE_SECONDS,
+                    lease_heartbeat_interval_seconds=0.05,
+                    poll_interval_seconds=0.05,
+                    backoff_multiplier=2.0,
+                    backoff_max_seconds=1.0,
+                    reaper_interval_seconds=0.05,
+                ),
+                timeout=5.0,
+            )
+    finally:
+        await _cancel_background_task(stopper)
+
+    assert any(
+        entry.get("event") == "job_lease_heartbeat_failed"
+        and entry.get("job_id") == job.id
+        for entry in cap_logs
+    )
+
+
+async def test_run_loop_reaps_expired_lease_from_dead_worker(
+    live_worker_db: async_sessionmaker[AsyncSession],
+) -> None:
+    worker_name = "worker-loop"
+    expired = datetime.now(UTC) - timedelta(seconds=1)
+
+    async with live_worker_db() as session:
+        await register_worker(
+            session,
+            name=worker_name,
+            hostname="host-a",
+            queues=["default"],
+        )
+        job = await _insert_running_job(
+            session,
+            worker_name="dead-worker",
+            lease_expires_at=expired,
+            attempts=1,
+            max_retries=3,
+        )
+
+    shutdown_event = asyncio.Event()
+
+    async def stop_after_reap() -> None:
+        for _ in range(100):
+            async with get_session() as session:
+                reaped_job = await session.scalar(select(Job).where(Job.id == job.id))
+                if (
+                    reaped_job is not None
+                    and reaped_job.status == JobStatus.RETRYING.value
+                    and reaped_job.locked_by is None
+                ):
+                    shutdown_event.set()
+                    return
+            await asyncio.sleep(0.02)
+
+    stopper = asyncio.create_task(stop_after_reap())
+    try:
+        with capture_logs() as cap_logs:
+            await asyncio.wait_for(
+                _run_loop(
+                    name=worker_name,
+                    shutdown_event=shutdown_event,
+                    **DEFAULT_RUN_LOOP_KWARGS,
+                ),
+                timeout=5.0,
+            )
+    finally:
+        await _cancel_background_task(stopper)
+
+    async with live_worker_db() as session:
+        reaped_job = await session.scalar(select(Job).where(Job.id == job.id))
+
+    assert reaped_job is not None
+    assert reaped_job.status == JobStatus.RETRYING.value
+    assert reaped_job.locked_by is None
+    assert any(entry.get("event") == "reaper_requeued_jobs" for entry in cap_logs)
 
 
 async def test_mark_offline_sets_status(
