@@ -18,6 +18,7 @@ from worker.claim import (
     reap_expired_jobs,
     release_in_flight_jobs,
 )
+from worker.complete import retry_delay_seconds
 
 DEFAULT_LEASE_SECONDS = 30
 
@@ -55,16 +56,25 @@ async def _insert_job(
     next_run_at: datetime | None = None,
     created_at: datetime | None = None,
     job_type: str = "test",
+    attempts: int = 0,
+    max_retries: int = 3,
+    payload_json: dict | None = None,
+    idempotency_key: str | None = None,
+    timeout_seconds: int = 60,
 ) -> Job:
     now = datetime.now(UTC)
     job = Job(
         queue=queue,
         job_type=job_type,
-        payload_json={},
+        payload_json=payload_json if payload_json is not None else {},
         status=status,
         priority=priority,
+        attempts=attempts,
+        max_retries=max_retries,
         next_run_at=next_run_at or now,
         created_at=created_at or now,
+        idempotency_key=idempotency_key,
+        timeout_seconds=timeout_seconds,
     )
     session.add(job)
     await session.commit()
@@ -80,16 +90,22 @@ async def _insert_running_job(
     lease_expires_at: datetime | None = None,
     attempts: int = 1,
     max_retries: int = 3,
+    priority: int = 0,
+    payload_json: dict | None = None,
+    idempotency_key: str | None = None,
+    timeout_seconds: int = 60,
+    job_type: str = "test",
+    created_at: datetime | None = None,
 ) -> Job:
     now = datetime.now(UTC)
     job = Job(
         queue=queue,
-        job_type="test",
-        payload_json={},
+        job_type=job_type,
+        payload_json=payload_json if payload_json is not None else {},
         status=JobStatus.RUNNING.value,
-        priority=0,
+        priority=priority,
         next_run_at=now,
-        created_at=now,
+        created_at=created_at or now,
         locked_by=worker_name,
         locked_at=now,
         lease_expires_at=(
@@ -97,6 +113,8 @@ async def _insert_running_job(
         ),
         attempts=attempts,
         max_retries=max_retries,
+        idempotency_key=idempotency_key,
+        timeout_seconds=timeout_seconds,
     )
     session.add(job)
     await session.commit()
@@ -353,6 +371,51 @@ async def test_claim_jobs_mutates_job_state(
     assert (
         claimed_job.lease_expires_at - claimed_job.locked_at
     ).total_seconds() == pytest.approx(DEFAULT_LEASE_SECONDS, abs=2)
+
+
+async def test_claim_jobs_reclaims_retrying_job_and_preserves_state(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    payload = {"foo": "bar"}
+    created_at = datetime(2026, 1, 15, 10, 0, 0, tzinfo=UTC)
+    async with live_claim_db() as session:
+        job = await _insert_job(
+            session,
+            queue="reports",
+            status=JobStatus.RETRYING.value,
+            priority=7,
+            attempts=1,
+            max_retries=5,
+            payload_json=payload,
+            idempotency_key="retry-key-1",
+            timeout_seconds=120,
+            created_at=created_at,
+        )
+
+    async with live_claim_db() as session:
+        claimed = await claim_jobs(
+            session,
+            queues=["reports"],
+            worker_name="worker-1",
+            limit=1,
+            lease_seconds=DEFAULT_LEASE_SECONDS,
+        )
+
+    assert len(claimed) == 1
+    claimed_job = claimed[0]
+    assert claimed_job.status == JobStatus.RUNNING.value
+    assert claimed_job.locked_by == "worker-1"
+    assert claimed_job.locked_at is not None
+    assert claimed_job.lease_expires_at is not None
+    assert claimed_job.attempts == 2
+    assert claimed_job.payload_json == payload
+    assert claimed_job.queue == "reports"
+    assert claimed_job.priority == 7
+    assert claimed_job.max_retries == 5
+    assert claimed_job.idempotency_key == "retry-key-1"
+    assert claimed_job.timeout_seconds == 120
+    assert claimed_job.created_at == created_at
+    assert claimed_job.id == job.id
 
 
 async def test_claim_jobs_returns_empty_when_limit_is_zero(
@@ -722,6 +785,54 @@ async def test_reap_expired_jobs_retries_job_under_max_retries(
     assert attempt.worker_id == "dead-worker"
 
 
+async def test_reap_expired_jobs_does_not_double_increment_attempts_and_preserves_state(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    expired = datetime.now(UTC) - timedelta(seconds=1)
+    payload = {"task": "reap-me"}
+    created_at = datetime(2026, 2, 1, 8, 30, 0, tzinfo=UTC)
+    async with live_claim_db() as session:
+        job = await _insert_running_job(
+            session,
+            worker_name="dead-worker",
+            queue="emails",
+            lease_expires_at=expired,
+            attempts=1,
+            max_retries=3,
+            priority=9,
+            payload_json=payload,
+            idempotency_key="reap-key-1",
+            timeout_seconds=90,
+            created_at=created_at,
+        )
+
+    async with live_claim_db() as session:
+        reaped = await reap_expired_jobs(session)
+
+    assert reaped == 1
+
+    async with live_claim_db() as session:
+        updated = await session.scalar(select(Job).where(Job.id == job.id))
+
+    assert updated is not None
+    assert updated.attempts == 1
+    assert updated.status == JobStatus.RETRYING.value
+    assert updated.locked_by is None
+    assert updated.locked_at is None
+    assert updated.lease_expires_at is None
+    assert updated.next_run_at is not None
+    assert (updated.next_run_at - updated.updated_at).total_seconds() == pytest.approx(
+        retry_delay_seconds(1), abs=2
+    )
+    assert updated.payload_json == payload
+    assert updated.queue == "emails"
+    assert updated.priority == 9
+    assert updated.max_retries == 3
+    assert updated.idempotency_key == "reap-key-1"
+    assert updated.timeout_seconds == 90
+    assert updated.created_at == created_at
+
+
 async def test_reap_expired_jobs_fails_job_at_max_retries(
     live_claim_db: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -757,6 +868,53 @@ async def test_reap_expired_jobs_fails_job_at_max_retries(
     assert attempt is not None
     assert attempt.status == JobAttemptStatus.FAILED.value
     assert attempt.worker_id == "dead-worker"
+
+
+async def test_reap_expired_jobs_at_max_retries_preserves_state(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    expired = datetime.now(UTC) - timedelta(seconds=1)
+    payload = {"task": "terminal-reap"}
+    created_at = datetime(2026, 2, 2, 12, 0, 0, tzinfo=UTC)
+    async with live_claim_db() as session:
+        job = await _insert_running_job(
+            session,
+            worker_name="dead-worker",
+            queue="market-data",
+            lease_expires_at=expired,
+            attempts=3,
+            max_retries=3,
+            priority=4,
+            payload_json=payload,
+            idempotency_key="reap-key-terminal",
+            timeout_seconds=45,
+            created_at=created_at,
+        )
+        original_next_run_at = job.next_run_at
+
+    async with live_claim_db() as session:
+        reaped = await reap_expired_jobs(session)
+
+    assert reaped == 1
+
+    async with live_claim_db() as session:
+        updated = await session.scalar(select(Job).where(Job.id == job.id))
+
+    assert updated is not None
+    assert updated.attempts == 3
+    assert updated.status == JobStatus.FAILED.value
+    assert updated.failed_at is not None
+    assert updated.next_run_at == original_next_run_at
+    assert updated.locked_by is None
+    assert updated.locked_at is None
+    assert updated.lease_expires_at is None
+    assert updated.payload_json == payload
+    assert updated.queue == "market-data"
+    assert updated.priority == 4
+    assert updated.max_retries == 3
+    assert updated.idempotency_key == "reap-key-terminal"
+    assert updated.timeout_seconds == 45
+    assert updated.created_at == created_at
 
 
 async def test_reap_expired_jobs_ignores_non_expired_leases(
