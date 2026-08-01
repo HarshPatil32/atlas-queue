@@ -311,6 +311,8 @@ async def test_mark_job_failed_marks_terminal_failure_when_retries_exhausted(
     assert updated.last_error == "permanent"
     assert updated.failed_at is not None
     assert updated.locked_by is None
+    assert updated.locked_at is None
+    assert updated.lease_expires_at is None
 
     assert attempt is not None
     assert attempt.status == JobAttemptStatus.FAILED.value
@@ -427,6 +429,9 @@ async def test_mark_job_failed_marks_terminal_failure_when_max_retries_is_zero(
     assert updated.status == JobStatus.FAILED.value
     assert updated.failed_at is not None
     assert updated.last_error == "no retries"
+    assert updated.locked_by is None
+    assert updated.locked_at is None
+    assert updated.lease_expires_at is None
 
     assert attempt is not None
     assert attempt.status == JobAttemptStatus.FAILED.value
