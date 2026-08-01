@@ -27,10 +27,12 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
     monkeypatch.setenv("LEASE_TTL_SECONDS", "60")
+    monkeypatch.setenv("LEASE_HEARTBEAT_INTERVAL_SECONDS", "5.0")
     monkeypatch.setenv("POLL_INTERVAL_SECONDS", "2.5")
     monkeypatch.setenv("WORKER_CONCURRENCY", "8")
     settings = _settings()
     assert settings.lease_ttl_seconds == 60
+    assert settings.lease_heartbeat_interval_seconds == 5.0
     assert settings.poll_interval_seconds == 2.5
     assert settings.worker_concurrency == 8
 
