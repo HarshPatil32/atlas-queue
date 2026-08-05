@@ -6,6 +6,7 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from core.backoff import retry_delay_seconds
 from core.config import get_settings
 from core.db import Base, dispose_engine, get_engine, get_sessionmaker
 from core.models import Job, JobAttempt, JobAttemptStatus, JobStatus
@@ -18,7 +19,6 @@ from worker.claim import (
     reap_expired_jobs,
     release_in_flight_jobs,
 )
-from worker.complete import retry_delay_seconds
 
 DEFAULT_LEASE_SECONDS = 30
 

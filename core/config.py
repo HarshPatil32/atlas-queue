@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     poll_interval_seconds: float = 1.0
     poll_backoff_multiplier: float = 2.0
     poll_backoff_max_seconds: float = 30.0
+    retry_backoff_base_seconds: float = 10.0
+    retry_backoff_multiplier: float = 3.0
+    retry_backoff_max_seconds: float = 300.0
     reaper_interval_seconds: float = 30.0
     worker_concurrency: int = 4
     log_level: str = "INFO"
@@ -76,6 +79,27 @@ class Settings(BaseSettings):
             raise ValueError("poll_backoff_max_seconds must be > 0")
         return v
 
+    @field_validator("retry_backoff_base_seconds")
+    @classmethod
+    def retry_backoff_base_positive(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("retry_backoff_base_seconds must be > 0")
+        return v
+
+    @field_validator("retry_backoff_multiplier")
+    @classmethod
+    def retry_backoff_multiplier_valid(cls, v: float) -> float:
+        if v < 1.0:
+            raise ValueError("retry_backoff_multiplier must be >= 1.0")
+        return v
+
+    @field_validator("retry_backoff_max_seconds")
+    @classmethod
+    def retry_backoff_max_positive(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("retry_backoff_max_seconds must be > 0")
+        return v
+
     @field_validator("reaper_interval_seconds")
     @classmethod
     def reaper_interval_positive(cls, v: float) -> float:
@@ -95,6 +119,14 @@ class Settings(BaseSettings):
         if self.lease_heartbeat_interval_seconds >= self.lease_ttl_seconds:
             raise ValueError(
                 "lease_heartbeat_interval_seconds must be < lease_ttl_seconds"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def retry_backoff_max_at_least_base(self) -> "Settings":
+        if self.retry_backoff_max_seconds < self.retry_backoff_base_seconds:
+            raise ValueError(
+                "retry_backoff_max_seconds must be >= retry_backoff_base_seconds"
             )
         return self
 

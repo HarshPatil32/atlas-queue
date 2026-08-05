@@ -3,8 +3,8 @@ from typing import Any, cast
 from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.backoff import retry_delay_seconds
 from core.models import Job, JobAttempt, JobAttemptStatus, JobStatus
-from worker.complete import retry_delay_seconds
 
 _CLAIMABLE_STATUSES = (
     JobStatus.QUEUED.value,

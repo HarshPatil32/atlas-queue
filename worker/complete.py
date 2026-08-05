@@ -3,17 +3,9 @@ from typing import Any
 from sqlalchemy import func, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.backoff import retry_delay_seconds
 from core.models import Job, JobAttempt, JobAttemptStatus, JobStatus
 from worker.execute import JobExecutionResult
-
-_MAX_RETRY_DELAY_SECONDS: int = 300
-
-
-def retry_delay_seconds(attempts: int) -> int:
-    exponential_delay = 1 << attempts
-    if exponential_delay > _MAX_RETRY_DELAY_SECONDS:
-        return _MAX_RETRY_DELAY_SECONDS
-    return exponential_delay
 
 
 async def mark_job_succeeded(
