@@ -283,7 +283,7 @@ async def test_mark_job_failed_retries_when_attempts_below_max(
     assert attempt.runtime_ms == 10
 
 
-async def test_mark_job_failed_marks_terminal_failure_when_retries_exhausted(
+async def test_mark_job_failed_marks_dead_letter_when_retries_exhausted(
     live_complete_db: async_sessionmaker[AsyncSession],
 ) -> None:
     async with live_complete_db() as session:
@@ -308,7 +308,7 @@ async def test_mark_job_failed_marks_terminal_failure_when_retries_exhausted(
         )
 
     assert updated is not None
-    assert updated.status == JobStatus.FAILED.value
+    assert updated.status == JobStatus.DEAD_LETTER.value
     assert updated.last_error == "permanent"
     assert updated.failed_at is not None
     assert updated.locked_by is None
@@ -319,6 +319,33 @@ async def test_mark_job_failed_marks_terminal_failure_when_retries_exhausted(
     assert attempt.status == JobAttemptStatus.FAILED.value
     assert attempt.error_message == "permanent"
     assert attempt.attempt_number == job.attempts
+
+
+async def test_mark_job_failed_marks_dead_letter_when_attempts_exceed_max_retries(
+    live_complete_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_complete_db() as session:
+        job = await _insert_running_job(
+            session,
+            worker_name=WORKER_NAME,
+            attempts=4,
+            max_retries=3,
+        )
+
+    async with live_complete_db() as session:
+        await mark_job_failed(
+            session,
+            outcome=_failed_outcome(job, error=RuntimeError("over-retried")),
+            worker_name=WORKER_NAME,
+        )
+
+    async with live_complete_db() as session:
+        updated = await session.scalar(select(Job).where(Job.id == job.id))
+
+    assert updated is not None
+    assert updated.status == JobStatus.DEAD_LETTER.value
+    assert updated.failed_at is not None
+    assert updated.last_error == "over-retried"
 
 
 async def test_mark_job_failed_rejects_succeeded_outcome(
@@ -402,7 +429,7 @@ async def test_mark_job_failed_with_no_error_leaves_error_fields_none(
     assert attempt.error_message is None
 
 
-async def test_mark_job_failed_marks_terminal_failure_when_max_retries_is_zero(
+async def test_mark_job_failed_marks_dead_letter_when_max_retries_is_zero(
     live_complete_db: async_sessionmaker[AsyncSession],
 ) -> None:
     async with live_complete_db() as session:
@@ -427,7 +454,7 @@ async def test_mark_job_failed_marks_terminal_failure_when_max_retries_is_zero(
         )
 
     assert updated is not None
-    assert updated.status == JobStatus.FAILED.value
+    assert updated.status == JobStatus.DEAD_LETTER.value
     assert updated.failed_at is not None
     assert updated.last_error == "no retries"
     assert updated.locked_by is None

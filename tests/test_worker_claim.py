@@ -833,7 +833,7 @@ async def test_reap_expired_jobs_does_not_double_increment_attempts_and_preserve
     assert updated.created_at == created_at
 
 
-async def test_reap_expired_jobs_fails_job_at_max_retries(
+async def test_reap_expired_jobs_marks_dead_letter_at_max_retries(
     live_claim_db: async_sessionmaker[AsyncSession],
 ) -> None:
     expired = datetime.now(UTC) - timedelta(seconds=1)
@@ -862,7 +862,7 @@ async def test_reap_expired_jobs_fails_job_at_max_retries(
         )
 
     assert updated is not None
-    assert updated.status == JobStatus.FAILED.value
+    assert updated.status == JobStatus.DEAD_LETTER.value
     assert updated.failed_at is not None
     assert updated.next_run_at == original_next_run_at
     assert attempt is not None
@@ -902,7 +902,7 @@ async def test_reap_expired_jobs_at_max_retries_preserves_state(
 
     assert updated is not None
     assert updated.attempts == 3
-    assert updated.status == JobStatus.FAILED.value
+    assert updated.status == JobStatus.DEAD_LETTER.value
     assert updated.failed_at is not None
     assert updated.next_run_at == original_next_run_at
     assert updated.locked_by is None
@@ -981,7 +981,7 @@ async def test_reap_expired_jobs_respects_limit(
     reaped_statuses = [
         status
         for job_id, status in statuses.items()
-        if status in (JobStatus.RETRYING.value, JobStatus.FAILED.value)
+        if status in (JobStatus.RETRYING.value, JobStatus.DEAD_LETTER.value)
     ]
     still_running = [
         job_id

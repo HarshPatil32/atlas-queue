@@ -58,7 +58,9 @@ async def mark_job_failed(
 
     job = outcome.job
     will_retry = job.attempts < job.max_retries
-    next_status = JobStatus.RETRYING.value if will_retry else JobStatus.FAILED.value
+    next_status = (
+        JobStatus.RETRYING.value if will_retry else JobStatus.DEAD_LETTER.value
+    )
     error_text = str(outcome.error) if outcome.error is not None else None
     now = func.now()
 

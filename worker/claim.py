@@ -165,7 +165,7 @@ async def reap_expired_jobs(
         will_retry = job.attempts < job.max_retries
         values: dict[str, Any] = {
             "status": (
-                JobStatus.RETRYING.value if will_retry else JobStatus.FAILED.value
+                JobStatus.RETRYING.value if will_retry else JobStatus.DEAD_LETTER.value
             ),
             "last_error": _REAP_ERROR_MESSAGE,
             "locked_by": None,
