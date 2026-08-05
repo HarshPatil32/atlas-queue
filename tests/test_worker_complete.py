@@ -266,6 +266,7 @@ async def test_mark_job_failed_retries_when_attempts_below_max(
 
     assert updated is not None
     assert updated.status == JobStatus.RETRYING.value
+    assert updated.attempts == job.attempts
     assert updated.last_error == "transient"
     assert updated.failed_at is None
     assert updated.locked_by is None
