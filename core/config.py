@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     retry_backoff_base_seconds: float = 10.0
     retry_backoff_multiplier: float = 3.0
     retry_backoff_max_seconds: float = 300.0
+    retry_backoff_jitter_ratio: float = 0.0
     reaper_interval_seconds: float = 30.0
     worker_concurrency: int = 4
     log_level: str = "INFO"
@@ -98,6 +99,13 @@ class Settings(BaseSettings):
     def retry_backoff_max_positive(cls, v: float) -> float:
         if v <= 0:
             raise ValueError("retry_backoff_max_seconds must be > 0")
+        return v
+
+    @field_validator("retry_backoff_jitter_ratio")
+    @classmethod
+    def retry_backoff_jitter_ratio_valid(cls, v: float) -> float:
+        if v < 0.0 or v > 1.0:
+            raise ValueError("retry_backoff_jitter_ratio must be between 0.0 and 1.0")
         return v
 
     @field_validator("reaper_interval_seconds")
