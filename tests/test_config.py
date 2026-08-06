@@ -18,6 +18,10 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.poll_interval_seconds == 1.0
     assert settings.poll_backoff_multiplier == 2.0
     assert settings.poll_backoff_max_seconds == 30.0
+    assert settings.retry_backoff_base_seconds == 10.0
+    assert settings.retry_backoff_multiplier == 3.0
+    assert settings.retry_backoff_max_seconds == 300.0
+    assert settings.retry_backoff_jitter_ratio == 0.0
     assert settings.reaper_interval_seconds == 30.0
     assert settings.worker_concurrency == 4
     assert settings.log_level == "INFO"
@@ -102,6 +106,70 @@ def test_invalid_poll_backoff_multiplier_raises(
 def test_invalid_poll_backoff_max_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
     monkeypatch.setenv("POLL_BACKOFF_MAX_SECONDS", "0")
+    with pytest.raises(ValidationError):
+        _settings()
+
+
+def test_retry_backoff_base_seconds_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    monkeypatch.setenv("RETRY_BACKOFF_BASE_SECONDS", "15.0")
+    settings = _settings()
+    assert settings.retry_backoff_base_seconds == 15.0
+
+
+def test_invalid_retry_backoff_base_seconds_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    monkeypatch.setenv("RETRY_BACKOFF_BASE_SECONDS", "0")
+    with pytest.raises(ValidationError):
+        _settings()
+
+
+def test_invalid_retry_backoff_multiplier_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    monkeypatch.setenv("RETRY_BACKOFF_MULTIPLIER", "0.5")
+    with pytest.raises(ValidationError):
+        _settings()
+
+
+def test_invalid_retry_backoff_max_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    monkeypatch.setenv("RETRY_BACKOFF_MAX_SECONDS", "0")
+    with pytest.raises(ValidationError):
+        _settings()
+
+
+def test_retry_backoff_max_must_be_at_least_base_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    monkeypatch.setenv("RETRY_BACKOFF_BASE_SECONDS", "100.0")
+    monkeypatch.setenv("RETRY_BACKOFF_MAX_SECONDS", "50.0")
+    with pytest.raises(ValidationError):
+        _settings()
+
+
+def test_retry_backoff_jitter_ratio_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    monkeypatch.setenv("RETRY_BACKOFF_JITTER_RATIO", "0.3")
+    settings = _settings()
+    assert settings.retry_backoff_jitter_ratio == 0.3
+
+
+@pytest.mark.parametrize("value", ["-0.1", "1.5"])
+def test_invalid_retry_backoff_jitter_ratio_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    monkeypatch.setenv("RETRY_BACKOFF_JITTER_RATIO", value)
     with pytest.raises(ValidationError):
         _settings()
 

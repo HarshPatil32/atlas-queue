@@ -3,17 +3,9 @@ from typing import Any
 from sqlalchemy import func, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.backoff import retry_delay_seconds
 from core.models import Job, JobAttempt, JobAttemptStatus, JobStatus
 from worker.execute import JobExecutionResult
-
-_MAX_RETRY_DELAY_SECONDS: int = 300
-
-
-def retry_delay_seconds(attempts: int) -> int:
-    exponential_delay = 1 << attempts
-    if exponential_delay > _MAX_RETRY_DELAY_SECONDS:
-        return _MAX_RETRY_DELAY_SECONDS
-    return exponential_delay
 
 
 async def mark_job_succeeded(
@@ -33,6 +25,8 @@ async def mark_job_succeeded(
         .values(
             status=JobStatus.SUCCEEDED.value,
             completed_at=now,
+            last_error=None,
+            failed_at=None,
             locked_by=None,
             locked_at=None,
             lease_expires_at=None,
@@ -66,7 +60,9 @@ async def mark_job_failed(
 
     job = outcome.job
     will_retry = job.attempts < job.max_retries
-    next_status = JobStatus.RETRYING.value if will_retry else JobStatus.FAILED.value
+    next_status = (
+        JobStatus.RETRYING.value if will_retry else JobStatus.DEAD_LETTER.value
+    )
     error_text = str(outcome.error) if outcome.error is not None else None
     now = func.now()
 
@@ -83,6 +79,7 @@ async def mark_job_failed(
             retry_delay_seconds=retry_delay_seconds(job.attempts),
         )
         values["next_run_at"] = now + retry_interval
+        values["failed_at"] = None
     else:
         values["failed_at"] = now
 
