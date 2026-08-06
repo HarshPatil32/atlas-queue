@@ -13,6 +13,7 @@ from core.models import Job, JobAttempt, JobAttemptStatus, JobStatus
 from tests.live_postgres import drop_metadata_tables, require_live_postgres_async
 from worker.claim import (
     _CLAIMABLE_STATUSES,
+    _SHUTDOWN_ATTEMPT_MESSAGE,
     claim_jobs,
     count_in_flight_jobs,
     extend_lease,
@@ -96,6 +97,8 @@ async def _insert_running_job(
     timeout_seconds: int = 60,
     job_type: str = "test",
     created_at: datetime | None = None,
+    last_error: str | None = None,
+    failed_at: datetime | None = None,
 ) -> Job:
     now = datetime.now(UTC)
     job = Job(
@@ -115,6 +118,8 @@ async def _insert_running_job(
         max_retries=max_retries,
         idempotency_key=idempotency_key,
         timeout_seconds=timeout_seconds,
+        last_error=last_error,
+        failed_at=failed_at,
     )
     session.add(job)
     await session.commit()
@@ -558,15 +563,29 @@ async def test_release_in_flight_jobs_returns_running_jobs_to_queued(
 
     assert released_one is not None
     assert released_one.status == JobStatus.QUEUED.value
+    assert released_one.attempts == 0
     assert released_one.locked_by is None
     assert released_one.locked_at is None
     assert released_one.lease_expires_at is None
 
     assert released_two is not None
     assert released_two.status == JobStatus.QUEUED.value
+    assert released_two.attempts == 0
     assert released_two.locked_by is None
     assert released_two.locked_at is None
     assert released_two.lease_expires_at is None
+
+    async with live_claim_db() as session:
+        cancelled_attempts = (
+            await session.scalars(
+                select(JobAttempt).where(
+                    JobAttempt.job_id.in_([job_one.id, job_two.id]),
+                    JobAttempt.status == JobAttemptStatus.CANCELLED.value,
+                )
+            )
+        ).all()
+
+    assert len(cancelled_attempts) == 2
 
 
 async def test_release_in_flight_jobs_ignores_other_workers(
@@ -618,6 +637,112 @@ async def test_release_in_flight_jobs_returns_zero_when_none(
         released = await release_in_flight_jobs(session, worker_name="worker-1")
 
     assert released == 0
+
+
+async def test_release_in_flight_jobs_decrements_attempts(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_claim_db() as session:
+        job = await _insert_running_job(
+            session,
+            worker_name="worker-1",
+            attempts=2,
+        )
+
+    async with live_claim_db() as session:
+        released = await release_in_flight_jobs(session, worker_name="worker-1")
+
+    assert released == 1
+
+    async with live_claim_db() as session:
+        updated = await session.scalar(select(Job).where(Job.id == job.id))
+
+    assert updated is not None
+    assert updated.attempts == 1
+
+
+async def test_release_in_flight_jobs_preserves_last_error_and_failed_at(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    stale_failed_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    async with live_claim_db() as session:
+        job = await _insert_running_job(
+            session,
+            worker_name="worker-1",
+            attempts=2,
+            last_error="prior failure",
+            failed_at=stale_failed_at,
+        )
+
+    async with live_claim_db() as session:
+        released = await release_in_flight_jobs(session, worker_name="worker-1")
+
+    assert released == 1
+
+    async with live_claim_db() as session:
+        updated = await session.scalar(select(Job).where(Job.id == job.id))
+
+    assert updated is not None
+    assert updated.last_error == "prior failure"
+    assert updated.failed_at == stale_failed_at
+
+
+async def test_release_in_flight_jobs_inserts_cancelled_job_attempt(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with live_claim_db() as session:
+        job = await _insert_running_job(
+            session,
+            worker_name="worker-1",
+            attempts=2,
+        )
+
+    async with live_claim_db() as session:
+        released = await release_in_flight_jobs(session, worker_name="worker-1")
+
+    assert released == 1
+
+    async with live_claim_db() as session:
+        attempt = await session.scalar(
+            select(JobAttempt).where(
+                JobAttempt.job_id == job.id,
+                JobAttempt.attempt_number == 2,
+            )
+        )
+
+    assert attempt is not None
+    assert attempt.status == JobAttemptStatus.CANCELLED.value
+    assert attempt.worker_id == "worker-1"
+    assert attempt.error_message == _SHUTDOWN_ATTEMPT_MESSAGE
+    assert attempt.finished_at is not None
+
+
+async def test_reap_expired_jobs_clears_stale_failed_at_when_retrying(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    expired = datetime.now(UTC) - timedelta(seconds=1)
+    stale_failed_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    async with live_claim_db() as session:
+        job = await _insert_running_job(
+            session,
+            worker_name="dead-worker",
+            lease_expires_at=expired,
+            attempts=1,
+            max_retries=3,
+            failed_at=stale_failed_at,
+        )
+
+    async with live_claim_db() as session:
+        reaped = await reap_expired_jobs(session)
+
+    assert reaped == 1
+
+    async with live_claim_db() as session:
+        updated = await session.scalar(select(Job).where(Job.id == job.id))
+
+    assert updated is not None
+    assert updated.status == JobStatus.RETRYING.value
+    assert updated.failed_at is None
 
 
 async def test_extend_lease_extends_lease_expires_at(

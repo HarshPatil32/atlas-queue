@@ -25,6 +25,8 @@ async def mark_job_succeeded(
         .values(
             status=JobStatus.SUCCEEDED.value,
             completed_at=now,
+            last_error=None,
+            failed_at=None,
             locked_by=None,
             locked_at=None,
             lease_expires_at=None,
@@ -77,6 +79,7 @@ async def mark_job_failed(
             retry_delay_seconds=retry_delay_seconds(job.attempts),
         )
         values["next_run_at"] = now + retry_interval
+        values["failed_at"] = None
     else:
         values["failed_at"] = now
 

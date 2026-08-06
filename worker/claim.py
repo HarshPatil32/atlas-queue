@@ -13,6 +13,7 @@ _CLAIMABLE_STATUSES = (
 )
 
 _REAP_ERROR_MESSAGE = "lease expired: worker did not renew in time"
+_SHUTDOWN_ATTEMPT_MESSAGE = "worker shutdown: job released before completion"
 _DEFAULT_REAP_LIMIT = 100
 
 
@@ -178,6 +179,7 @@ async def reap_expired_jobs(
                 "make_interval(secs => :retry_delay_seconds)"
             ).bindparams(retry_delay_seconds=retry_delay_seconds(job.attempts))
             values["next_run_at"] = now + retry_interval
+            values["failed_at"] = None
         else:
             values["failed_at"] = now
 
@@ -213,11 +215,8 @@ async def release_in_flight_jobs(
     *,
     worker_name: str,
 ) -> int:
-    """Return this worker's running jobs to queued (graceful shutdown).
-
-    Does not decrement attempts (incremented at claim) or change next_run_at;
-    retry vs shutdown semantics for those fields belong in Epic 7.
-    """
+    """Return this worker's running jobs to queued (graceful shutdown)."""
+    now = func.now()
     stmt = (
         update(Job)
         .where(
@@ -226,14 +225,27 @@ async def release_in_flight_jobs(
         )
         .values(
             status=JobStatus.QUEUED.value,
+            attempts=Job.attempts - 1,
             locked_by=None,
             locked_at=None,
             lease_expires_at=None,
-            updated_at=func.now(),
+            updated_at=now,
         )
-        .returning(Job.id)
+        .returning(Job)
     )
     result = await session.execute(stmt)
-    released_count = len(result.scalars().all())
+    released_jobs = cast(list[Job], result.scalars().all())
+    for job in released_jobs:
+        session.add(
+            JobAttempt(
+                job_id=job.id,
+                worker_id=worker_name,
+                # job.attempts is post-decrement; +1 is the in-flight attempt number.
+                attempt_number=job.attempts + 1,
+                status=JobAttemptStatus.CANCELLED.value,
+                finished_at=now,
+                error_message=_SHUTDOWN_ATTEMPT_MESSAGE,
+            )
+        )
     await session.commit()
-    return released_count
+    return len(released_jobs)

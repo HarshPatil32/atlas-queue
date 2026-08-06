@@ -49,6 +49,8 @@ async def _insert_running_job(
     lease_expires_at: datetime | None = None,
     attempts: int = 1,
     max_retries: int = 3,
+    last_error: str | None = None,
+    failed_at: datetime | None = None,
 ) -> Job:
     now = datetime.now(UTC)
     job = Job(
@@ -66,6 +68,8 @@ async def _insert_running_job(
         ),
         attempts=attempts,
         max_retries=max_retries,
+        last_error=last_error,
+        failed_at=failed_at,
     )
     session.add(job)
     await session.commit()
@@ -463,3 +467,59 @@ async def test_mark_job_failed_marks_dead_letter_when_max_retries_is_zero(
 
     assert attempt is not None
     assert attempt.status == JobAttemptStatus.FAILED.value
+
+
+async def test_mark_job_failed_clears_stale_failed_at_when_retrying(
+    live_complete_db: async_sessionmaker[AsyncSession],
+) -> None:
+    stale_failed_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    async with live_complete_db() as session:
+        job = await _insert_running_job(
+            session,
+            worker_name=WORKER_NAME,
+            attempts=1,
+            max_retries=3,
+            failed_at=stale_failed_at,
+        )
+
+    async with live_complete_db() as session:
+        await mark_job_failed(
+            session,
+            outcome=_failed_outcome(job, error=ValueError("transient")),
+            worker_name=WORKER_NAME,
+        )
+
+    async with live_complete_db() as session:
+        updated = await session.scalar(select(Job).where(Job.id == job.id))
+
+    assert updated is not None
+    assert updated.status == JobStatus.RETRYING.value
+    assert updated.failed_at is None
+
+
+async def test_mark_job_succeeded_clears_stale_error_fields(
+    live_complete_db: async_sessionmaker[AsyncSession],
+) -> None:
+    stale_failed_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    async with live_complete_db() as session:
+        job = await _insert_running_job(
+            session,
+            worker_name=WORKER_NAME,
+            last_error="prior failure",
+            failed_at=stale_failed_at,
+        )
+
+    async with live_complete_db() as session:
+        await mark_job_succeeded(
+            session,
+            outcome=_succeeded_outcome(job),
+            worker_name=WORKER_NAME,
+        )
+
+    async with live_complete_db() as session:
+        updated = await session.scalar(select(Job).where(Job.id == job.id))
+
+    assert updated is not None
+    assert updated.status == JobStatus.SUCCEEDED.value
+    assert updated.last_error is None
+    assert updated.failed_at is None
