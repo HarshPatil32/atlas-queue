@@ -904,6 +904,7 @@ async def test_reap_expired_jobs_retries_job_under_max_retries(
     assert updated.locked_at is None
     assert updated.lease_expires_at is None
     assert updated.last_error == "lease expired: worker did not renew in time"
+    assert updated.dead_lettered_at is None
     assert updated.next_run_at is not None
     assert attempt is not None
     assert attempt.status == JobAttemptStatus.FAILED.value
@@ -989,6 +990,7 @@ async def test_reap_expired_jobs_marks_dead_letter_at_max_retries(
     assert updated is not None
     assert updated.status == JobStatus.DEAD_LETTER.value
     assert updated.failed_at is not None
+    assert updated.dead_lettered_at is not None
     assert updated.next_run_at == original_next_run_at
     assert attempt is not None
     assert attempt.status == JobAttemptStatus.FAILED.value
@@ -1029,6 +1031,7 @@ async def test_reap_expired_jobs_at_max_retries_preserves_state(
     assert updated.attempts == 3
     assert updated.status == JobStatus.DEAD_LETTER.value
     assert updated.failed_at is not None
+    assert updated.dead_lettered_at is not None
     assert updated.next_run_at == original_next_run_at
     assert updated.locked_by is None
     assert updated.locked_at is None

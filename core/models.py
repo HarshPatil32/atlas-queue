@@ -126,6 +126,10 @@ class Job(Base):
         DateTime(timezone=True),
         nullable=True,
     )
+    dead_lettered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
 
 
 class JobAttemptStatus(StrEnum):

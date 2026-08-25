@@ -51,6 +51,7 @@ async def _insert_running_job(
     max_retries: int = 3,
     last_error: str | None = None,
     failed_at: datetime | None = None,
+    dead_lettered_at: datetime | None = None,
 ) -> Job:
     now = datetime.now(UTC)
     job = Job(
@@ -70,6 +71,7 @@ async def _insert_running_job(
         max_retries=max_retries,
         last_error=last_error,
         failed_at=failed_at,
+        dead_lettered_at=dead_lettered_at,
     )
     session.add(job)
     await session.commit()
@@ -235,6 +237,7 @@ async def test_mark_job_failed_handles_unknown_job_type_error(
     assert updated.status == JobStatus.RETRYING.value
     assert updated.last_error == "unknown job_type: 'missing'"
     assert updated.failed_at is None
+    assert updated.dead_lettered_at is None
     assert updated.next_run_at > original_next_run_at
 
     assert attempt is not None
@@ -273,6 +276,7 @@ async def test_mark_job_failed_retries_when_attempts_below_max(
     assert updated.attempts == job.attempts
     assert updated.last_error == "transient"
     assert updated.failed_at is None
+    assert updated.dead_lettered_at is None
     assert updated.locked_by is None
     assert updated.locked_at is None
     assert updated.lease_expires_at is None
@@ -315,6 +319,7 @@ async def test_mark_job_failed_marks_dead_letter_when_retries_exhausted(
     assert updated.status == JobStatus.DEAD_LETTER.value
     assert updated.last_error == "permanent"
     assert updated.failed_at is not None
+    assert updated.dead_lettered_at is not None
     assert updated.locked_by is None
     assert updated.locked_at is None
     assert updated.lease_expires_at is None
@@ -349,6 +354,7 @@ async def test_mark_job_failed_marks_dead_letter_when_attempts_exceed_max_retrie
     assert updated is not None
     assert updated.status == JobStatus.DEAD_LETTER.value
     assert updated.failed_at is not None
+    assert updated.dead_lettered_at is not None
     assert updated.last_error == "over-retried"
 
 
@@ -460,6 +466,7 @@ async def test_mark_job_failed_marks_dead_letter_when_max_retries_is_zero(
     assert updated is not None
     assert updated.status == JobStatus.DEAD_LETTER.value
     assert updated.failed_at is not None
+    assert updated.dead_lettered_at is not None
     assert updated.last_error == "no retries"
     assert updated.locked_by is None
     assert updated.locked_at is None
@@ -495,6 +502,7 @@ async def test_mark_job_failed_clears_stale_failed_at_when_retrying(
     assert updated is not None
     assert updated.status == JobStatus.RETRYING.value
     assert updated.failed_at is None
+    assert updated.dead_lettered_at is None
 
 
 async def test_mark_job_succeeded_clears_stale_error_fields(
@@ -507,6 +515,7 @@ async def test_mark_job_succeeded_clears_stale_error_fields(
             worker_name=WORKER_NAME,
             last_error="prior failure",
             failed_at=stale_failed_at,
+            dead_lettered_at=stale_failed_at,
         )
 
     async with live_complete_db() as session:
@@ -523,3 +532,4 @@ async def test_mark_job_succeeded_clears_stale_error_fields(
     assert updated.status == JobStatus.SUCCEEDED.value
     assert updated.last_error is None
     assert updated.failed_at is None
+    assert updated.dead_lettered_at is None

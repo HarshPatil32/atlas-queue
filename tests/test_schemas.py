@@ -229,6 +229,7 @@ def test_job_response_constructible_by_field_names() -> None:
         updated_at=now,
         completed_at=None,
         failed_at=None,
+        dead_lettered_at=None,
         last_error=None,
     )
 
@@ -255,6 +256,7 @@ def test_job_response_model_validate_maps_orm_fields() -> None:
         updated_at=now,
         completed_at=None,
         failed_at=None,
+        dead_lettered_at=None,
         last_error=None,
     )
 
@@ -288,6 +290,7 @@ def test_job_response_status_serializes_to_string() -> None:
         updated_at=now,
         completed_at=None,
         failed_at=None,
+        dead_lettered_at=None,
         last_error=None,
     )
 

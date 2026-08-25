@@ -60,6 +60,7 @@ class JobResponse(BaseModel):
     updated_at: datetime
     completed_at: datetime | None
     failed_at: datetime | None
+    dead_lettered_at: datetime | None
     last_error: str | None
 
 

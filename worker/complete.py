@@ -27,6 +27,7 @@ async def mark_job_succeeded(
             completed_at=now,
             last_error=None,
             failed_at=None,
+            dead_lettered_at=None,
             locked_by=None,
             locked_at=None,
             lease_expires_at=None,
@@ -80,8 +81,10 @@ async def mark_job_failed(
         )
         values["next_run_at"] = now + retry_interval
         values["failed_at"] = None
+        values["dead_lettered_at"] = None
     else:
         values["failed_at"] = now
+        values["dead_lettered_at"] = now
 
     updated_job_id = await session.scalar(
         update(Job)
