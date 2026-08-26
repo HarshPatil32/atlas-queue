@@ -5,8 +5,14 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.deps import get_db
-from core.models import Job, JobStatus
-from core.schemas import DEFAULT_LIMIT, MAX_LIMIT, JobListResponse, JobResponse
+from core.models import Job, JobAttempt, JobStatus
+from core.schemas import (
+    DEFAULT_LIMIT,
+    MAX_LIMIT,
+    DeadLetterJobDetailResponse,
+    JobListResponse,
+    JobResponse,
+)
 
 router = APIRouter(prefix="/dead-letter", tags=["dead-letter"])
 
@@ -44,6 +50,40 @@ async def list_dead_letter_jobs(
     )
 
     return JobListResponse(jobs=list(rows), total=total, limit=limit, offset=offset)
+
+
+@router.get("/{job_id}", response_model=DeadLetterJobDetailResponse)
+async def get_dead_letter_job(
+    job_id: int,
+    session: Annotated[AsyncSession, Depends(get_db)],
+) -> DeadLetterJobDetailResponse:
+    job = await session.get(Job, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != JobStatus.DEAD_LETTER.value:
+        raise HTTPException(
+            status_code=409,
+            detail="Job is not in dead_letter status",
+        )
+
+    attempts = list(
+        (
+            await session.execute(
+                select(JobAttempt)
+                .where(JobAttempt.job_id == job_id)
+                .order_by(JobAttempt.attempt_number)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    return DeadLetterJobDetailResponse.model_validate(
+        {
+            **JobResponse.model_validate(job).model_dump(),
+            "attempt_history": attempts,
+        }
+    )
 
 
 @router.post("/{job_id}/retry", response_model=JobResponse)

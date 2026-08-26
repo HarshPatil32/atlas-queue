@@ -4,7 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from core.models import JobStatus
+from core.models import JobAttemptStatus, JobStatus
 
 DEFAULT_QUEUE = "default"
 MAX_PAYLOAD_SIZE_BYTES = 256 * 1024
@@ -69,3 +69,20 @@ class JobListResponse(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class JobAttemptResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    attempt_id: int = Field(validation_alias="id")
+    attempt_number: int
+    worker_id: str
+    status: JobAttemptStatus
+    started_at: datetime
+    finished_at: datetime | None
+    error_message: str | None
+    runtime_ms: int | None
+
+
+class DeadLetterJobDetailResponse(JobResponse):
+    attempt_history: list[JobAttemptResponse]

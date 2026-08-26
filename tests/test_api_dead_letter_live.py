@@ -480,6 +480,158 @@ async def test_delete_dead_letter_job_returns_409_for_non_dead_letter_statuses(
         assert persisted is not None
 
 
+async def _seed_job_with_attempts(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    *,
+    attempt_count: int = 3,
+) -> tuple[Job, list[JobAttempt]]:
+    dead_lettered_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    job = await _seed_job(
+        sessionmaker,
+        job_status=JobStatus.DEAD_LETTER.value,
+        attempts=attempt_count,
+        last_error="max retries exceeded",
+        failed_at=dead_lettered_at,
+        dead_lettered_at=dead_lettered_at,
+    )
+    attempts: list[JobAttempt] = []
+    async with sessionmaker() as session:
+        for attempt_number in range(1, attempt_count + 1):
+            started_at = dead_lettered_at + timedelta(minutes=attempt_number - 1)
+            finished_at = started_at + timedelta(seconds=30)
+            attempt = JobAttempt(
+                job_id=job.id,
+                worker_id=f"worker-{attempt_number}",
+                attempt_number=attempt_number,
+                status=JobAttemptStatus.FAILED.value,
+                started_at=started_at,
+                finished_at=finished_at,
+                error_message=f"error on attempt {attempt_number}",
+                runtime_ms=attempt_number * 1000,
+            )
+            session.add(attempt)
+            attempts.append(attempt)
+        await session.commit()
+        for attempt in attempts:
+            await session.refresh(attempt)
+    return job, attempts
+
+
+@pytest.fixture
+async def seeded_dead_letter_job_with_attempts(
+    live_client: tuple[AsyncClient, async_sessionmaker[AsyncSession]],
+) -> tuple[Job, list[JobAttempt]]:
+    _http_client, sessionmaker = live_client
+    return await _seed_job_with_attempts(sessionmaker)
+
+
+async def test_get_dead_letter_job_returns_attempt_history_ordered_by_attempt_number(
+    live_client: tuple[AsyncClient, async_sessionmaker[AsyncSession]],
+    seeded_dead_letter_job_with_attempts: tuple[Job, list[JobAttempt]],
+) -> None:
+    http_client, _sessionmaker = live_client
+    job, attempts = seeded_dead_letter_job_with_attempts
+
+    response = await http_client.get(f"/dead-letter/{job.id}")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job_id"] == job.id
+    assert len(body["attempt_history"]) == len(attempts)
+    assert [attempt["attempt_number"] for attempt in body["attempt_history"]] == [
+        1,
+        2,
+        3,
+    ]
+
+
+async def test_get_dead_letter_job_returns_correct_error_messages_per_attempt(
+    live_client: tuple[AsyncClient, async_sessionmaker[AsyncSession]],
+    seeded_dead_letter_job_with_attempts: tuple[Job, list[JobAttempt]],
+) -> None:
+    http_client, _sessionmaker = live_client
+    job, attempts = seeded_dead_letter_job_with_attempts
+
+    response = await http_client.get(f"/dead-letter/{job.id}")
+
+    assert response.status_code == 200
+    attempt_history = response.json()["attempt_history"]
+    history_by_number = {
+        attempt["attempt_number"]: attempt for attempt in attempt_history
+    }
+    for attempt in attempts:
+        record = history_by_number[attempt.attempt_number]
+        assert record["error_message"] == attempt.error_message
+        assert record["runtime_ms"] == attempt.runtime_ms
+        assert record["worker_id"] == attempt.worker_id
+
+
+async def test_get_dead_letter_job_returns_empty_attempt_history_when_none_recorded(
+    live_client: tuple[AsyncClient, async_sessionmaker[AsyncSession]],
+) -> None:
+    http_client, sessionmaker = live_client
+    dead_lettered_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    job = await _seed_job(
+        sessionmaker,
+        job_status=JobStatus.DEAD_LETTER.value,
+        attempts=0,
+        last_error="max retries exceeded",
+        failed_at=dead_lettered_at,
+        dead_lettered_at=dead_lettered_at,
+    )
+
+    response = await http_client.get(f"/dead-letter/{job.id}")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job_id"] == job.id
+    assert body["last_error"] == "max retries exceeded"
+    assert body["attempt_history"] == []
+
+
+async def test_get_dead_letter_job_returns_404_for_missing_job(
+    live_client: tuple[AsyncClient, async_sessionmaker[AsyncSession]],
+) -> None:
+    http_client, _sessionmaker = live_client
+
+    response = await http_client.get("/dead-letter/999999")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Job not found"}
+
+
+@pytest.mark.parametrize(
+    "job_status",
+    [
+        JobStatus.FAILED.value,
+        JobStatus.QUEUED.value,
+        JobStatus.SCHEDULED.value,
+        JobStatus.RUNNING.value,
+        JobStatus.SUCCEEDED.value,
+        JobStatus.RETRYING.value,
+        JobStatus.CANCELLED.value,
+    ],
+)
+async def test_get_dead_letter_job_returns_409_for_non_dead_letter_statuses(
+    live_client: tuple[AsyncClient, async_sessionmaker[AsyncSession]],
+    job_status: str,
+) -> None:
+    http_client, sessionmaker = live_client
+    created_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    attempts = 3 if job_status == JobStatus.FAILED.value else 0
+    job = await _seed_job(
+        sessionmaker,
+        job_status=job_status,
+        attempts=attempts,
+        failed_at=created_at if job_status == JobStatus.FAILED.value else None,
+    )
+
+    response = await http_client.get(f"/dead-letter/{job.id}")
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Job is not in dead_letter status"}
+
+
 async def test_delete_dead_letter_job_is_atomic_under_concurrent_requests(
     live_client: tuple[AsyncClient, async_sessionmaker[AsyncSession]],
 ) -> None:
