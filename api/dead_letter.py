@@ -1,7 +1,7 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, select, update
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.deps import get_db
@@ -72,6 +72,30 @@ async def retry_dead_letter_job(
     if retried_job is not None:
         await session.commit()
         return retried_job
+
+    existing_job = await session.get(Job, job_id)
+    if existing_job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    raise HTTPException(
+        status_code=409,
+        detail="Job is not in dead_letter status",
+    )
+
+
+@router.delete("/{job_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_dead_letter_job(
+    job_id: int,
+    session: Annotated[AsyncSession, Depends(get_db)],
+) -> None:
+    result = await session.execute(
+        delete(Job)
+        .where(Job.id == job_id, Job.status == JobStatus.DEAD_LETTER.value)
+        .returning(Job.id)
+    )
+    deleted_id = result.scalar_one_or_none()
+    if deleted_id is not None:
+        await session.commit()
+        return
 
     existing_job = await session.get(Job, job_id)
     if existing_job is None:

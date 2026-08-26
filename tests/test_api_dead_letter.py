@@ -16,6 +16,7 @@ def _make_dead_letter_job(
     job_id: int = 1,
     queue: str = "emails",
     job_type: str = "send_email",
+    job_status: str = JobStatus.DEAD_LETTER.value,
     last_error: str | None = "max retries exceeded",
 ) -> Job:
     now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
@@ -24,7 +25,7 @@ def _make_dead_letter_job(
         queue=queue,
         job_type=job_type,
         payload_json={"to": "user@example.com"},
-        status=JobStatus.DEAD_LETTER.value,
+        status=job_status,
         priority=5,
         attempts=3,
         max_retries=3,
@@ -53,6 +54,9 @@ class FakeResult:
         assert self._scalar is not None
         return self._scalar
 
+    def scalar_one_or_none(self) -> int | None:
+        return self._scalar
+
     def scalars(self) -> "FakeResult":
         return self
 
@@ -65,8 +69,20 @@ class FakeSession:
         self.list_jobs_rows: list[Job] = []
         self.list_jobs_total = 0
         self.execute_call_count = 0
+        self.jobs: dict[int, Job] = {}
+        self.delete_returning_id: int | None = None
+        self.committed = False
+
+    async def get(self, model: type, job_id: int) -> Job | None:
+        return self.jobs.get(job_id)
+
+    async def commit(self) -> None:
+        self.committed = True
 
     async def execute(self, statement: Any) -> FakeResult:
+        if getattr(statement, "is_delete", False):
+            return FakeResult(scalar=self.delete_returning_id)
+
         self.execute_call_count += 1
         if self.execute_call_count == 1:
             return FakeResult(scalar=self.list_jobs_total)
@@ -196,3 +212,56 @@ async def test_list_dead_letter_jobs_rejects_invalid_query_params(
     response = await http_client.get(f"/dead-letter?{query}")
 
     assert response.status_code == expected_status
+
+
+async def test_delete_dead_letter_job_returns_204(
+    client_with_session: tuple[AsyncClient, FakeSession],
+) -> None:
+    http_client, fake_session = client_with_session
+    fake_session.delete_returning_id = 1
+
+    response = await http_client.delete("/dead-letter/1")
+
+    assert response.status_code == 204
+    assert response.content == b""
+    assert fake_session.committed is True
+
+
+async def test_delete_dead_letter_job_returns_404_when_job_missing(
+    client_with_session: tuple[AsyncClient, FakeSession],
+) -> None:
+    http_client, fake_session = client_with_session
+    fake_session.delete_returning_id = None
+
+    response = await http_client.delete("/dead-letter/999")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Job not found"}
+    assert fake_session.committed is False
+
+
+async def test_delete_dead_letter_job_returns_409_when_not_dead_letter(
+    client_with_session: tuple[AsyncClient, FakeSession],
+) -> None:
+    http_client, fake_session = client_with_session
+    fake_session.delete_returning_id = None
+    fake_session.jobs[1] = _make_dead_letter_job(
+        job_id=1,
+        job_status=JobStatus.QUEUED.value,
+    )
+
+    response = await http_client.delete("/dead-letter/1")
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Job is not in dead_letter status"}
+    assert fake_session.committed is False
+
+
+async def test_delete_dead_letter_job_rejects_invalid_job_id(
+    client_with_session: tuple[AsyncClient, FakeSession],
+) -> None:
+    http_client, _fake_session = client_with_session
+
+    response = await http_client.delete("/dead-letter/not-a-number")
+
+    assert response.status_code == 422

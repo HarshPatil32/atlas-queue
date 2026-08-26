@@ -6,7 +6,7 @@ from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from core.models import Job, JobStatus
+from core.models import Job, JobAttempt, JobAttemptStatus, JobStatus
 
 
 def _job(
@@ -372,3 +372,136 @@ async def test_retry_dead_letter_job_is_atomic_under_concurrent_requests(
         ).scalar_one()
         assert persisted.status == JobStatus.QUEUED.value
         assert persisted.attempts == 0
+
+
+async def test_delete_dead_letter_job_removes_row(
+    live_client: tuple[AsyncClient, async_sessionmaker[AsyncSession]],
+) -> None:
+    http_client, sessionmaker = live_client
+    dead_lettered_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    job = await _seed_job(
+        sessionmaker,
+        job_status=JobStatus.DEAD_LETTER.value,
+        attempts=3,
+        last_error="max retries exceeded",
+        failed_at=dead_lettered_at,
+        dead_lettered_at=dead_lettered_at,
+    )
+
+    response = await http_client.delete(f"/dead-letter/{job.id}")
+
+    assert response.status_code == 204
+    assert response.content == b""
+
+    async with sessionmaker() as session:
+        persisted = await session.get(Job, job.id)
+        assert persisted is None
+
+
+async def test_delete_dead_letter_job_cascades_to_job_attempts(
+    live_client: tuple[AsyncClient, async_sessionmaker[AsyncSession]],
+) -> None:
+    http_client, sessionmaker = live_client
+    dead_lettered_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    job = await _seed_job(
+        sessionmaker,
+        job_status=JobStatus.DEAD_LETTER.value,
+        attempts=3,
+        last_error="max retries exceeded",
+        failed_at=dead_lettered_at,
+        dead_lettered_at=dead_lettered_at,
+    )
+    async with sessionmaker() as session:
+        attempt = JobAttempt(
+            job_id=job.id,
+            worker_id="worker-1",
+            attempt_number=1,
+            status=JobAttemptStatus.FAILED.value,
+            error_message="max retries exceeded",
+        )
+        session.add(attempt)
+        await session.commit()
+        await session.refresh(attempt)
+
+    response = await http_client.delete(f"/dead-letter/{job.id}")
+
+    assert response.status_code == 204
+
+    async with sessionmaker() as session:
+        assert await session.get(Job, job.id) is None
+        persisted_attempt = await session.get(JobAttempt, attempt.id)
+        assert persisted_attempt is None
+
+
+async def test_delete_dead_letter_job_returns_404_for_missing_job(
+    live_client: tuple[AsyncClient, async_sessionmaker[AsyncSession]],
+) -> None:
+    http_client, _sessionmaker = live_client
+
+    response = await http_client.delete("/dead-letter/999999")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Job not found"}
+
+
+@pytest.mark.parametrize(
+    "job_status",
+    [
+        JobStatus.FAILED.value,
+        JobStatus.QUEUED.value,
+        JobStatus.SCHEDULED.value,
+        JobStatus.RUNNING.value,
+        JobStatus.SUCCEEDED.value,
+        JobStatus.RETRYING.value,
+        JobStatus.CANCELLED.value,
+    ],
+)
+async def test_delete_dead_letter_job_returns_409_for_non_dead_letter_statuses(
+    live_client: tuple[AsyncClient, async_sessionmaker[AsyncSession]],
+    job_status: str,
+) -> None:
+    http_client, sessionmaker = live_client
+    created_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    attempts = 3 if job_status == JobStatus.FAILED.value else 0
+    job = await _seed_job(
+        sessionmaker,
+        job_status=job_status,
+        attempts=attempts,
+        failed_at=created_at if job_status == JobStatus.FAILED.value else None,
+    )
+
+    response = await http_client.delete(f"/dead-letter/{job.id}")
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Job is not in dead_letter status"}
+
+    async with sessionmaker() as session:
+        persisted = await session.get(Job, job.id)
+        assert persisted is not None
+
+
+async def test_delete_dead_letter_job_is_atomic_under_concurrent_requests(
+    live_client: tuple[AsyncClient, async_sessionmaker[AsyncSession]],
+) -> None:
+    http_client, sessionmaker = live_client
+    dead_lettered_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    job = await _seed_job(
+        sessionmaker,
+        job_status=JobStatus.DEAD_LETTER.value,
+        attempts=3,
+        last_error="max retries exceeded",
+        failed_at=dead_lettered_at,
+        dead_lettered_at=dead_lettered_at,
+    )
+
+    response_one, response_two = await asyncio.gather(
+        http_client.delete(f"/dead-letter/{job.id}"),
+        http_client.delete(f"/dead-letter/{job.id}"),
+    )
+
+    status_codes = sorted([response_one.status_code, response_two.status_code])
+    assert status_codes == [204, 404]
+
+    async with sessionmaker() as session:
+        persisted = await session.get(Job, job.id)
+        assert persisted is None
