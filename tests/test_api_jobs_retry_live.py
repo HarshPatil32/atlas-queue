@@ -19,6 +19,7 @@ def _job(
     attempts: int = 0,
     last_error: str | None = None,
     failed_at: datetime | None = None,
+    dead_lettered_at: datetime | None = None,
     locked_by: str | None = None,
     locked_at: datetime | None = None,
     lease_expires_at: datetime | None = None,
@@ -36,6 +37,7 @@ def _job(
         timeout_seconds=60,
         last_error=last_error,
         failed_at=failed_at,
+        dead_lettered_at=dead_lettered_at,
         locked_by=locked_by,
         locked_at=locked_at,
         lease_expires_at=lease_expires_at,
@@ -51,6 +53,7 @@ async def _seed_job(
     attempts: int = 0,
     last_error: str | None = None,
     failed_at: datetime | None = None,
+    dead_lettered_at: datetime | None = None,
 ) -> Job:
     created_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
     job = _job(
@@ -61,6 +64,7 @@ async def _seed_job(
         attempts=attempts,
         last_error=last_error,
         failed_at=failed_at,
+        dead_lettered_at=dead_lettered_at,
     )
     async with sessionmaker() as session:
         session.add(job)
@@ -84,6 +88,11 @@ async def test_retry_job_persists_queued_status_and_resets_fields(
         attempts=3,
         last_error="boom",
         failed_at=datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC),
+        dead_lettered_at=(
+            datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+            if job_status == JobStatus.DEAD_LETTER.value
+            else None
+        ),
     )
 
     response = await http_client.post(f"/jobs/{job.id}/retry")
@@ -95,6 +104,7 @@ async def test_retry_job_persists_queued_status_and_resets_fields(
     assert body["attempts"] == 0
     assert body["last_error"] is None
     assert body["failed_at"] is None
+    assert body["dead_lettered_at"] is None
 
     async with sessionmaker() as session:
         persisted = await session.get(Job, job.id)
@@ -103,6 +113,7 @@ async def test_retry_job_persists_queued_status_and_resets_fields(
         assert persisted.attempts == 0
         assert persisted.last_error is None
         assert persisted.failed_at is None
+        assert persisted.dead_lettered_at is None
         assert persisted.locked_by is None
         assert persisted.locked_at is None
         assert persisted.lease_expires_at is None

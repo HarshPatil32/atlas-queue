@@ -16,6 +16,7 @@ def _job(
     job_type: str,
     job_status: str,
     created_at: datetime,
+    dead_lettered_at: datetime | None = None,
 ) -> Job:
     return Job(
         id=job_id,
@@ -28,6 +29,7 @@ def _job(
         max_retries=3,
         next_run_at=created_at,
         timeout_seconds=60,
+        dead_lettered_at=dead_lettered_at,
         created_at=created_at,
         updated_at=created_at,
     )
@@ -37,6 +39,7 @@ async def _seed_job(
     sessionmaker: async_sessionmaker[AsyncSession],
     *,
     job_status: str,
+    dead_lettered_at: datetime | None = None,
 ) -> Job:
     created_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
     job = _job(
@@ -44,6 +47,7 @@ async def _seed_job(
         job_type="send_email",
         job_status=job_status,
         created_at=created_at,
+        dead_lettered_at=dead_lettered_at,
     )
     async with sessionmaker() as session:
         session.add(job)
@@ -54,14 +58,23 @@ async def _seed_job(
 
 @pytest.mark.parametrize(
     "job_status",
-    [JobStatus.QUEUED.value, JobStatus.SCHEDULED.value],
+    [JobStatus.QUEUED.value, JobStatus.SCHEDULED.value, JobStatus.DEAD_LETTER.value],
 )
 async def test_cancel_job_persists_cancelled_status_for_cancellable_jobs(
     live_client: tuple[AsyncClient, async_sessionmaker[AsyncSession]],
     job_status: str,
 ) -> None:
     http_client, sessionmaker = live_client
-    job = await _seed_job(sessionmaker, job_status=job_status)
+    dead_lettered_at = (
+        datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+        if job_status == JobStatus.DEAD_LETTER.value
+        else None
+    )
+    job = await _seed_job(
+        sessionmaker,
+        job_status=job_status,
+        dead_lettered_at=dead_lettered_at,
+    )
 
     response = await http_client.post(f"/jobs/{job.id}/cancel")
 
@@ -69,11 +82,13 @@ async def test_cancel_job_persists_cancelled_status_for_cancellable_jobs(
     body = response.json()
     assert body["job_id"] == job.id
     assert body["status"] == "cancelled"
+    assert body["dead_lettered_at"] is None
 
     async with sessionmaker() as session:
         persisted = await session.get(Job, job.id)
         assert persisted is not None
         assert persisted.status == JobStatus.CANCELLED.value
+        assert persisted.dead_lettered_at is None
         assert persisted.updated_at > job.updated_at
 
 
@@ -102,7 +117,6 @@ async def test_cancel_job_returns_409_and_leaves_running_job_unchanged(
     [
         JobStatus.SUCCEEDED.value,
         JobStatus.FAILED.value,
-        JobStatus.DEAD_LETTER.value,
         JobStatus.CANCELLED.value,
     ],
 )

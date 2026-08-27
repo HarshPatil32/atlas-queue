@@ -17,7 +17,11 @@ from core.schemas import (
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
-_CANCELLABLE_STATUSES = (JobStatus.QUEUED.value, JobStatus.SCHEDULED.value)
+_CANCELLABLE_STATUSES = (
+    JobStatus.QUEUED.value,
+    JobStatus.SCHEDULED.value,
+    JobStatus.DEAD_LETTER.value,
+)
 _RETRYABLE_STATUSES = (JobStatus.FAILED.value, JobStatus.DEAD_LETTER.value)
 
 
@@ -119,7 +123,11 @@ async def cancel_job(
     result = await session.execute(
         update(Job)
         .where(Job.id == job_id, Job.status.in_(_CANCELLABLE_STATUSES))
-        .values(status=JobStatus.CANCELLED.value, updated_at=func.now())
+        .values(
+            status=JobStatus.CANCELLED.value,
+            dead_lettered_at=None,
+            updated_at=func.now(),
+        )
         .returning(Job)
     )
     cancelled_job = result.scalars().one_or_none()
@@ -152,6 +160,7 @@ async def retry_job(
             next_run_at=func.now(),
             last_error=None,
             failed_at=None,
+            dead_lettered_at=None,
             locked_by=None,
             locked_at=None,
             lease_expires_at=None,
