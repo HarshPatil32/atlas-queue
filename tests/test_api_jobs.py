@@ -201,11 +201,25 @@ async def test_create_job_maps_request_fields_to_job(
     assert job.timeout_seconds == 120
     assert job.idempotency_key == "order-123"
     assert job.next_run_at == datetime(2026, 6, 1, 15, 30, 0, tzinfo=UTC)
-    assert job.status == JobStatus.QUEUED.value
+    assert job.status == JobStatus.SCHEDULED.value
 
     body = response.json()
-    assert body["status"] == "queued"
+    assert body["status"] == "scheduled"
     assert body["run_at"] == run_at
+
+
+async def test_create_job_without_run_at_is_queued(
+    client_with_session: tuple[AsyncClient, FakeSession],
+) -> None:
+    http_client, fake_session = client_with_session
+    response = await http_client.post(
+        "/jobs",
+        json={"queue": "emails", "job_type": "send_email"},
+    )
+
+    assert response.status_code == 201
+    assert fake_session.added[0].status == JobStatus.QUEUED.value
+    assert response.json()["status"] == "queued"
 
 
 async def test_create_job_defaults_queue_when_omitted(
