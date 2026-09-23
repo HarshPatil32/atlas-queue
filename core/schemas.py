@@ -1,8 +1,8 @@
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from core.models import JobAttemptStatus, JobStatus
 
@@ -62,6 +62,12 @@ class JobResponse(BaseModel):
     failed_at: datetime | None
     dead_lettered_at: datetime | None
     last_error: str | None
+
+    @model_validator(mode="after")
+    def derive_queued_status_when_scheduled_job_is_due(self) -> "JobResponse":
+        if self.status == JobStatus.SCHEDULED and self.run_at <= datetime.now(UTC):
+            self.status = JobStatus.QUEUED
+        return self
 
 
 class JobListResponse(BaseModel):

@@ -42,6 +42,7 @@ async def create_job(
     )
     if payload.run_at is not None:
         job.next_run_at = payload.run_at
+        job.status = JobStatus.SCHEDULED.value
     session.add(job)
     try:
         await session.commit()
