@@ -271,6 +271,35 @@ async def test_claim_jobs_skips_jobs_not_yet_due(
     assert claimed[0].id == due.id
 
 
+async def test_claim_jobs_skips_scheduled_job_not_yet_due_and_claims_when_due(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    future = datetime.now(UTC) + timedelta(hours=1)
+    async with live_claim_db() as session:
+        due = await _insert_job(
+            session,
+            status=JobStatus.SCHEDULED.value,
+            next_run_at=datetime.now(UTC),
+        )
+        await _insert_job(
+            session,
+            status=JobStatus.SCHEDULED.value,
+            next_run_at=future,
+        )
+
+    async with live_claim_db() as session:
+        claimed = await claim_jobs(
+            session,
+            queues=["default"],
+            worker_name="worker-1",
+            limit=10,
+            lease_seconds=DEFAULT_LEASE_SECONDS,
+        )
+
+    assert len(claimed) == 1
+    assert claimed[0].id == due.id
+
+
 async def test_claim_jobs_claims_job_at_exact_next_run_at(
     live_claim_db: async_sessionmaker[AsyncSession],
 ) -> None:
