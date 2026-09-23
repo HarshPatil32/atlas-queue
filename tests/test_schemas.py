@@ -1,5 +1,5 @@
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
@@ -297,3 +297,75 @@ def test_job_response_status_serializes_to_string() -> None:
     dumped = response.model_dump(mode="json")
 
     assert dumped["status"] == "queued"
+
+
+def _scheduled_job(*, next_run_at: datetime) -> Job:
+    now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    return Job(
+        id=1,
+        queue="default",
+        job_type="send_email",
+        payload_json={},
+        status=JobStatus.SCHEDULED.value,
+        priority=0,
+        attempts=0,
+        max_retries=3,
+        next_run_at=next_run_at,
+        timeout_seconds=60,
+        idempotency_key=None,
+        created_at=now,
+        updated_at=now,
+        completed_at=None,
+        failed_at=None,
+        dead_lettered_at=None,
+        last_error=None,
+    )
+
+
+def test_job_response_derives_queued_status_for_due_scheduled_job() -> None:
+    past = datetime.now(UTC) - timedelta(hours=1)
+    response = JobResponse.model_validate(_scheduled_job(next_run_at=past))
+
+    assert response.status == JobStatus.QUEUED
+
+
+def test_job_response_keeps_scheduled_status_for_not_yet_due_job() -> None:
+    future = datetime.now(UTC) + timedelta(hours=1)
+    response = JobResponse.model_validate(_scheduled_job(next_run_at=future))
+
+    assert response.status == JobStatus.SCHEDULED
+
+
+def test_job_response_does_not_derive_status_for_due_retrying_job() -> None:
+    now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    past = datetime.now(UTC) - timedelta(hours=1)
+    job = Job(
+        id=1,
+        queue="default",
+        job_type="send_email",
+        payload_json={},
+        status=JobStatus.RETRYING.value,
+        priority=0,
+        attempts=1,
+        max_retries=3,
+        next_run_at=past,
+        timeout_seconds=60,
+        idempotency_key=None,
+        created_at=now,
+        updated_at=now,
+        completed_at=None,
+        failed_at=None,
+        dead_lettered_at=None,
+        last_error="boom",
+    )
+
+    response = JobResponse.model_validate(job)
+
+    assert response.status == JobStatus.RETRYING
+
+
+def test_job_response_due_scheduled_status_serializes_to_queued() -> None:
+    past = datetime.now(UTC) - timedelta(hours=1)
+    response = JobResponse.model_validate(_scheduled_job(next_run_at=past))
+
+    assert response.model_dump(mode="json")["status"] == "queued"

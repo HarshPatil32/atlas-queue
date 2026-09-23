@@ -1,5 +1,5 @@
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -18,8 +18,11 @@ def _make_job(
     job_status: str = JobStatus.RUNNING.value,
     last_error: str | None = None,
     idempotency_key: str | None = "order-123",
+    next_run_at: datetime | None = None,
 ) -> Job:
     now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    if next_run_at is None:
+        next_run_at = datetime(2026, 6, 1, 15, 30, 0, tzinfo=UTC)
     return Job(
         id=job_id,
         queue="emails",
@@ -29,7 +32,7 @@ def _make_job(
         priority=5,
         attempts=2,
         max_retries=3,
-        next_run_at=datetime(2026, 6, 1, 15, 30, 0, tzinfo=UTC),
+        next_run_at=next_run_at,
         timeout_seconds=120,
         idempotency_key=idempotency_key,
         locked_by="worker-1",
@@ -171,7 +174,7 @@ async def test_create_job_maps_request_fields_to_job(
     client_with_session: tuple[AsyncClient, FakeSession],
 ) -> None:
     http_client, fake_session = client_with_session
-    run_at = "2026-06-01T15:30:00Z"
+    run_at = "2027-06-01T15:30:00Z"
 
     response = await http_client.post(
         "/jobs",
@@ -200,7 +203,7 @@ async def test_create_job_maps_request_fields_to_job(
     assert job.max_retries == 2
     assert job.timeout_seconds == 120
     assert job.idempotency_key == "order-123"
-    assert job.next_run_at == datetime(2026, 6, 1, 15, 30, 0, tzinfo=UTC)
+    assert job.next_run_at == datetime(2027, 6, 1, 15, 30, 0, tzinfo=UTC)
     assert job.status == JobStatus.SCHEDULED.value
 
     body = response.json()
@@ -390,6 +393,59 @@ async def test_get_job_does_not_expose_internal_lease_fields(
     assert "lease_expires_at" not in body
 
 
+async def test_get_job_returns_queued_status_for_due_scheduled_job(
+    client_with_session: tuple[AsyncClient, FakeSession],
+) -> None:
+    http_client, fake_session = client_with_session
+    past = datetime.now(UTC) - timedelta(hours=1)
+    fake_session.jobs[1] = _make_job(
+        job_status=JobStatus.SCHEDULED.value,
+        next_run_at=past,
+    )
+
+    response = await http_client.get("/jobs/1")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "queued"
+
+
+async def test_get_job_keeps_scheduled_status_for_not_yet_due_job(
+    client_with_session: tuple[AsyncClient, FakeSession],
+) -> None:
+    http_client, fake_session = client_with_session
+    future = datetime.now(UTC) + timedelta(hours=1)
+    fake_session.jobs[1] = _make_job(
+        job_status=JobStatus.SCHEDULED.value,
+        next_run_at=future,
+    )
+
+    response = await http_client.get("/jobs/1")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "scheduled"
+
+
+async def test_list_jobs_derives_queued_status_for_due_scheduled_jobs(
+    client_with_session: tuple[AsyncClient, FakeSession],
+) -> None:
+    http_client, fake_session = client_with_session
+    past = datetime.now(UTC) - timedelta(hours=1)
+    fake_session.list_jobs_rows = [
+        _make_job(
+            job_id=1,
+            job_status=JobStatus.SCHEDULED.value,
+            next_run_at=past,
+            idempotency_key=None,
+        )
+    ]
+    fake_session.list_jobs_total = 1
+
+    response = await http_client.get("/jobs")
+
+    assert response.status_code == 200
+    assert response.json()["jobs"][0]["status"] == "queued"
+
+
 async def test_list_jobs_returns_200_with_paginated_envelope(
     client_with_session: tuple[AsyncClient, FakeSession],
 ) -> None:
@@ -460,7 +516,9 @@ async def test_cancel_job_returns_200_for_cancellable_statuses(
     job_status: str,
 ) -> None:
     http_client, fake_session = client_with_session
-    cancelled_job = _make_job(job_id=1, job_status=JobStatus.CANCELLED.value)
+    fake_session.jobs[1] = _make_job(job_id=1, job_status=job_status)
+    cancelled_job = _make_job(job_id=1, job_status=job_status)
+    cancelled_job.status = JobStatus.CANCELLED.value
     fake_session.update_returning_rows = [cancelled_job]
 
     response = await http_client.post("/jobs/1/cancel")
