@@ -227,6 +227,124 @@ async def test_claim_jobs_orders_by_priority_next_run_at_created_at(
     ]
 
 
+async def test_claim_jobs_orders_by_priority_desc_over_next_run_at_and_created_at(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    async with live_claim_db() as session:
+        job_low = await _insert_job(
+            session,
+            priority=-1,
+            next_run_at=base,
+            created_at=base,
+        )
+        job_high = await _insert_job(
+            session,
+            priority=10,
+            next_run_at=base + timedelta(minutes=2),
+            created_at=base + timedelta(seconds=2),
+        )
+        job_mid = await _insert_job(
+            session,
+            priority=0,
+            next_run_at=base + timedelta(minutes=1),
+            created_at=base + timedelta(seconds=1),
+        )
+
+    async with live_claim_db() as session:
+        claimed = await claim_jobs(
+            session,
+            queues=["default"],
+            worker_name="worker-1",
+            limit=10,
+            lease_seconds=DEFAULT_LEASE_SECONDS,
+        )
+
+    assert [job.id for job in claimed] == [
+        job_high.id,
+        job_mid.id,
+        job_low.id,
+    ]
+
+
+async def test_claim_jobs_applies_priority_before_limit(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    async with live_claim_db() as session:
+        low_jobs = []
+        for i in range(3):
+            low_jobs.append(
+                await _insert_job(
+                    session,
+                    priority=1,
+                    next_run_at=base + timedelta(seconds=i),
+                    created_at=base + timedelta(seconds=i),
+                )
+            )
+        job_high = await _insert_job(
+            session,
+            priority=100,
+            next_run_at=base + timedelta(hours=1),
+            created_at=base + timedelta(hours=1),
+        )
+
+    async with live_claim_db() as session:
+        claimed = await claim_jobs(
+            session,
+            queues=["default"],
+            worker_name="worker-1",
+            limit=1,
+            lease_seconds=DEFAULT_LEASE_SECONDS,
+        )
+
+    assert len(claimed) == 1
+    assert claimed[0].id == job_high.id
+
+    async with live_claim_db() as session:
+        remaining_queued = (
+            await session.scalars(
+                select(Job).where(Job.status == JobStatus.QUEUED.value)
+            )
+        ).all()
+
+    assert len(remaining_queued) == 3
+    assert {job.id for job in remaining_queued} == {job.id for job in low_jobs}
+
+
+async def test_claim_jobs_orders_equal_priority_by_next_run_at_before_created_at(
+    live_claim_db: async_sessionmaker[AsyncSession],
+) -> None:
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    async with live_claim_db() as session:
+        job_later_next_run = await _insert_job(
+            session,
+            priority=5,
+            next_run_at=base + timedelta(minutes=1),
+            created_at=base,
+        )
+        job_earlier_next_run = await _insert_job(
+            session,
+            priority=5,
+            next_run_at=base,
+            created_at=base + timedelta(seconds=2),
+        )
+
+    async with live_claim_db() as session:
+        claimed = await claim_jobs(
+            session,
+            queues=["default"],
+            worker_name="worker-1",
+            limit=10,
+            lease_seconds=DEFAULT_LEASE_SECONDS,
+        )
+
+    assert [job.id for job in claimed] == [
+        job_earlier_next_run.id,
+        job_later_next_run.id,
+    ]
+
+
 async def test_claim_jobs_skips_non_claimable_statuses(
     live_claim_db: async_sessionmaker[AsyncSession],
 ) -> None:
