@@ -226,6 +226,7 @@ async def test_list_dead_letter_jobs_accepts_filter_and_pagination_params(
     ("query", "expected_status"),
     [
         ("queue=", 422),
+        ("queue=Bad-Queue", 422),
         ("job_type=", 422),
         ("limit=0", 422),
         (f"limit={MAX_LIMIT + 1}", 422),

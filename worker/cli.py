@@ -1,10 +1,11 @@
 import argparse
 import os
+import re
 import socket
 from dataclasses import dataclass
 
 from core.config import Settings, get_settings
-from core.schemas import DEFAULT_QUEUE
+from core.schemas import DEFAULT_QUEUE, QUEUE_NAME_MAX_LENGTH, QUEUE_NAME_PATTERN
 
 MAX_NAME_LENGTH = 255
 
@@ -23,9 +24,14 @@ def _validate_queue(value: str) -> str:
     queue = value.strip()
     if not queue:
         raise argparse.ArgumentTypeError("queue name must be non-empty")
-    if len(queue) > MAX_NAME_LENGTH:
+    if len(queue) > QUEUE_NAME_MAX_LENGTH:
         raise argparse.ArgumentTypeError(
-            f"queue name must be at most {MAX_NAME_LENGTH} characters"
+            f"queue name must be at most {QUEUE_NAME_MAX_LENGTH} characters"
+        )
+    if re.fullmatch(QUEUE_NAME_PATTERN, queue) is None:
+        raise argparse.ArgumentTypeError(
+            "invalid queue name (lowercase letters, digits, '.', '_', '-', "
+            f"max {QUEUE_NAME_MAX_LENGTH} chars, must start with a letter or digit)"
         )
     return queue
 

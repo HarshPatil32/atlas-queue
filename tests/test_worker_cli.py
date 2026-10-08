@@ -1,7 +1,7 @@
 import pytest
 
 from core.config import Settings
-from core.schemas import DEFAULT_QUEUE
+from core.schemas import DEFAULT_QUEUE, QUEUE_NAME_MAX_LENGTH
 from tests.conftest import DATABASE_URL
 from worker.cli import MAX_NAME_LENGTH, default_worker_name, parse_args
 
@@ -22,6 +22,22 @@ def test_queues_parsed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
     args = parse_args(["--queues", "a", "b", "c"], settings=_settings())
     assert args.queues == ["a", "b", "c"]
+
+
+def test_queues_parsed_valid_multi_word_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    args = parse_args(
+        ["--queues", "market-data", "emails", "high-priority"],
+        settings=_settings(),
+    )
+    assert args.queues == ["market-data", "emails", "high-priority"]
+
+
+def test_queue_at_max_length_parsed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    queue = "a" + "b" * (QUEUE_NAME_MAX_LENGTH - 1)
+    args = parse_args(["--queues", queue], settings=_settings())
+    assert args.queues == [queue]
 
 
 def test_concurrency_override(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -63,7 +79,20 @@ def test_empty_queue_raises(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_overlong_queue_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
     with pytest.raises(SystemExit):
-        parse_args(["--queues", "a" * (MAX_NAME_LENGTH + 1)], settings=_settings())
+        parse_args(
+            ["--queues", "a" * (QUEUE_NAME_MAX_LENGTH + 1)],
+            settings=_settings(),
+        )
+
+
+@pytest.mark.parametrize("queue", ["Emails", "-bad", "bad/name"])
+def test_invalid_queue_name_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    queue: str,
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    with pytest.raises(SystemExit):
+        parse_args(["--queues", queue], settings=_settings())
 
 
 def test_empty_name_raises(monkeypatch: pytest.MonkeyPatch) -> None:

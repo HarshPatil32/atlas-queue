@@ -251,6 +251,34 @@ async def test_create_job_rejects_invalid_body(
     assert response.status_code == 422
 
 
+@pytest.mark.parametrize("queue", ["Emails", "-bad", "a" * 65])
+async def test_create_job_rejects_invalid_queue_name(
+    client_with_session: tuple[AsyncClient, FakeSession],
+    queue: str,
+) -> None:
+    http_client, _fake_session = client_with_session
+    response = await http_client.post(
+        "/jobs",
+        json={"queue": queue, "job_type": "send_email"},
+    )
+
+    assert response.status_code == 422
+
+
+async def test_create_job_accepts_arbitrary_valid_queue_name(
+    client_with_session: tuple[AsyncClient, FakeSession],
+) -> None:
+    http_client, fake_session = client_with_session
+    response = await http_client.post(
+        "/jobs",
+        json={"queue": "market-data", "job_type": "send_email"},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["queue"] == "market-data"
+    assert fake_session.added[0].queue == "market-data"
+
+
 async def test_create_job_returns_200_with_existing_job_when_idempotency_key_conflicts(
     client_with_session: tuple[AsyncClient, FakeSession],
 ) -> None:
@@ -489,6 +517,7 @@ async def test_list_jobs_does_not_expose_internal_lease_fields(
     [
         ("status=not-a-status", 422),
         ("queue=", 422),
+        ("queue=Bad-Queue", 422),
         ("job_type=", 422),
         ("limit=0", 422),
         (f"limit={MAX_LIMIT + 1}", 422),
