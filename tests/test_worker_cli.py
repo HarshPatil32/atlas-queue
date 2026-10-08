@@ -33,6 +33,55 @@ def test_queues_parsed_valid_multi_word_names(monkeypatch: pytest.MonkeyPatch) -
     assert args.queues == ["market-data", "emails", "high-priority"]
 
 
+def test_queues_comma_separated(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    args = parse_args(["--queues", "reports,market-data"], settings=_settings())
+    assert args.queues == ["reports", "market-data"]
+
+
+def test_queues_comma_and_space_separated(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    args = parse_args(["--queues", "a,b", "c"], settings=_settings())
+    assert args.queues == ["a", "b", "c"]
+
+
+def test_queues_deduplicated_preserving_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    args = parse_args(["--queues", "a,b", "a"], settings=_settings())
+    assert args.queues == ["a", "b"]
+
+
+def test_queues_comma_whitespace_stripped(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    args = parse_args(["--queues", "a, b"], settings=_settings())
+    assert args.queues == ["a", "b"]
+
+
+@pytest.mark.parametrize("queues_arg", ["a,,b", "a,", ",a", ","])
+def test_empty_queue_segment_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    queues_arg: str,
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    with pytest.raises(SystemExit):
+        parse_args(["--queues", queues_arg], settings=_settings())
+
+
+def test_invalid_name_in_comma_list_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    with pytest.raises(SystemExit):
+        parse_args(["--queues", "good,Bad"], settings=_settings())
+
+
+def test_overlong_segment_in_comma_list_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    overlong = "a" * (QUEUE_NAME_MAX_LENGTH + 1)
+    with pytest.raises(SystemExit):
+        parse_args(["--queues", f"ok,{overlong}"], settings=_settings())
+
+
 def test_queue_at_max_length_parsed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
     queue = "a" + "b" * (QUEUE_NAME_MAX_LENGTH - 1)
