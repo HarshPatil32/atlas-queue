@@ -95,6 +95,20 @@ class JobListResponse(BaseModel):
     offset: int
 
 
+class QueueResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    queue: str
+    job_count: int
+
+
+class QueueListResponse(BaseModel):
+    queues: list[QueueResponse]
+    total: int
+    limit: int
+    offset: int
+
+
 class JobAttemptResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
