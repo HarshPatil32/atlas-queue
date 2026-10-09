@@ -109,6 +109,23 @@ class QueueListResponse(BaseModel):
     offset: int
 
 
+class QueueOldestJobResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+    job_id: int = Field(validation_alias="id")
+    job_type: str
+    status: JobStatus
+    created_at: datetime
+    run_at: datetime = Field(validation_alias="next_run_at")
+
+
+class QueueStatsResponse(BaseModel):
+    queue: str
+    depth: int
+    status_counts: dict[JobStatus, int]
+    oldest_job: QueueOldestJobResponse | None
+
+
 class JobAttemptResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
