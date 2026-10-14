@@ -13,6 +13,7 @@ from core.schemas import (
     JobCreateRequest,
     JobListResponse,
     JobResponse,
+    QueueName,
 )
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -70,7 +71,7 @@ async def create_job(
 @router.get("", response_model=JobListResponse)
 async def list_jobs(
     session: Annotated[AsyncSession, Depends(get_db)],
-    queue: Annotated[str | None, Query(min_length=1, max_length=255)] = None,
+    queue: Annotated[QueueName | None, Query()] = None,
     job_status: Annotated[JobStatus | None, Query(alias="status")] = None,
     job_type: Annotated[str | None, Query(min_length=1, max_length=255)] = None,
     limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,

@@ -12,6 +12,7 @@ from core.schemas import (
     DeadLetterJobDetailResponse,
     JobListResponse,
     JobResponse,
+    QueueName,
 )
 
 router = APIRouter(prefix="/dead-letter", tags=["dead-letter"])
@@ -20,7 +21,7 @@ router = APIRouter(prefix="/dead-letter", tags=["dead-letter"])
 @router.get("", response_model=JobListResponse)
 async def list_dead_letter_jobs(
     session: Annotated[AsyncSession, Depends(get_db)],
-    queue: Annotated[str | None, Query(min_length=1, max_length=255)] = None,
+    queue: Annotated[QueueName | None, Query()] = None,
     job_type: Annotated[str | None, Query(min_length=1, max_length=255)] = None,
     limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
     offset: Annotated[int, Query(ge=0)] = 0,

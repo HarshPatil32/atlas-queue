@@ -1,12 +1,30 @@
 import json
 from datetime import UTC, datetime
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 from core.models import JobAttemptStatus, JobStatus
 
 DEFAULT_QUEUE = "default"
+QUEUE_NAME_MAX_LENGTH = 64
+QUEUE_NAME_PATTERN = r"^[a-z0-9][a-z0-9._-]*$"
+QueueName = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=QUEUE_NAME_MAX_LENGTH,
+        pattern=QUEUE_NAME_PATTERN,
+    ),
+]
 MAX_PAYLOAD_SIZE_BYTES = 256 * 1024
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 100
@@ -15,7 +33,7 @@ MAX_LIMIT = 100
 class JobCreateRequest(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
-    queue: str = Field(default=DEFAULT_QUEUE, min_length=1, max_length=255)
+    queue: QueueName = DEFAULT_QUEUE
     job_type: str = Field(min_length=1, max_length=255)
     payload: dict[str, Any] = Field(default_factory=dict)
     priority: int = Field(default=0, ge=-1000, le=1000)
@@ -75,6 +93,37 @@ class JobListResponse(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class QueueResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    queue: str
+    job_count: int
+
+
+class QueueListResponse(BaseModel):
+    queues: list[QueueResponse]
+    total: int
+    limit: int
+    offset: int
+
+
+class QueueOldestJobResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+    job_id: int = Field(validation_alias="id")
+    job_type: str
+    status: JobStatus
+    created_at: datetime
+    run_at: datetime = Field(validation_alias="next_run_at")
+
+
+class QueueStatsResponse(BaseModel):
+    queue: str
+    depth: int
+    status_counts: dict[JobStatus, int]
+    oldest_job: QueueOldestJobResponse | None
 
 
 class JobAttemptResponse(BaseModel):

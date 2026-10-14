@@ -8,6 +8,7 @@ from core.models import Job, JobStatus
 from core.schemas import (
     DEFAULT_QUEUE,
     MAX_PAYLOAD_SIZE_BYTES,
+    QUEUE_NAME_MAX_LENGTH,
     JobCreateRequest,
     JobResponse,
 )
@@ -38,6 +39,36 @@ def test_job_create_request_rejects_empty_or_whitespace_queue(queue: str) -> Non
         JobCreateRequest(queue=queue, job_type="send_email")
 
 
+@pytest.mark.parametrize(
+    "queue",
+    ["emails", "reports", "market-data", "high-priority", "a.b_c-1"],
+)
+def test_job_create_request_accepts_valid_queue_names(queue: str) -> None:
+    request = JobCreateRequest(queue=queue, job_type="send_email")
+
+    assert request.queue == queue
+
+
+@pytest.mark.parametrize(
+    "queue",
+    [
+        "a" * (QUEUE_NAME_MAX_LENGTH + 1),
+        "Emails",
+        "high priority",
+        "queue/name",
+        "queue:name",
+        "queue*name",
+        "-leading",
+        ".leading",
+        "em\nails",
+        "café",
+    ],
+)
+def test_job_create_request_rejects_invalid_queue_names(queue: str) -> None:
+    with pytest.raises(ValidationError):
+        JobCreateRequest(queue=queue, job_type="send_email")
+
+
 @pytest.mark.parametrize("job_type", ["", "   "])
 def test_job_create_request_rejects_empty_or_whitespace_job_type(
     job_type: str,
@@ -51,6 +82,21 @@ def test_job_create_request_strips_whitespace_from_queue_and_job_type() -> None:
 
     assert request.queue == "default"
     assert request.job_type == "send_email"
+
+
+def test_job_create_request_strips_newlines_from_queue() -> None:
+    request = JobCreateRequest(queue=" emails\n", job_type="send_email")
+
+    assert request.queue == "emails"
+
+
+def test_job_create_request_accepts_queue_name_at_max_length() -> None:
+    queue = "a" + "b" * (QUEUE_NAME_MAX_LENGTH - 1)
+    assert len(queue) == QUEUE_NAME_MAX_LENGTH
+
+    request = JobCreateRequest(queue=queue, job_type="send_email")
+
+    assert request.queue == queue
 
 
 def test_job_create_request_rejects_unknown_fields() -> None:
